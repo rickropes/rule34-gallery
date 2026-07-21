@@ -1,0 +1,78 @@
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# IDEs
+# =========================
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# Logs
+# =========================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# =========================
+# Environment
+# =========================
+.env
+.env.*
+!.env.example
+
+# ==================================================
+# Chrome Extension
+# ==================================================
+chrome-extension/node_modules/
+chrome-extension/dist/
+chrome-extension/build/
+chrome-extension/*.pem
+chrome-extension/*.crx
+
+# ==================================================
+# Google Apps Script
+# ==================================================
+google-apps-script/node_modules/
+google-apps-script/.clasp.json
+
+# ==================================================
+# Android Share App
+# ==================================================
+mobile-share-android/.gradle/
+mobile-share-android/.idea/
+mobile-share-android/local.properties
+mobile-share-android/**/*.iml
+mobile-share-android/**/build/
+mobile-share-android/captures/
+
+# ==================================================
+# Tauri Desktop App
+# ==================================================
+rule34GalleryWork/node_modules/
+rule34GalleryWork/dist/
+rule34GalleryWork/build/
+
+rule34GalleryWork/src-tauri/target/
+rule34GalleryWork/src-tauri/gen/
+rule34GalleryWork/src-tauri/.cargo/
+
+# SQLite databases (optional)
+rule34GalleryWork/*.db
+rule34GalleryWork/*.sqlite
+rule34GalleryWork/*.sqlite3
+
+# ==================================================
+# Rust
+# ==================================================
+**/target/
+Cargo.lock
+
+# Keep Cargo.lock if this becomes a library:
+#! Cargo.lock
