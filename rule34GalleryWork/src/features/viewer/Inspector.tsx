@@ -34,6 +34,10 @@ function formatSize(bytes: number) {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
+const PREVIEW_HEIGHT_STORAGE_KEY = "rule34-library.inspector-preview-height-v6";
+const MIN_PREVIEW_HEIGHT = 160;
+const MAX_PREVIEW_HEIGHT = 900;
+
 function resultMessage(action: string, result: ProcessMediaResult) {
   const done = `${action}: processed ${result.processedCount} item${result.processedCount === 1 ? "" : "s"}.`;
   return result.errors.length ? `${done}\n\n${result.errors.join("\n")}` : done;
@@ -48,6 +52,16 @@ export default function Inspector() {
   const setSearch = useAppStore((s) => s.setSearch);
   const viewerOpen = useAppStore((s) => s.viewerOpen);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const inspectorRef = useRef<HTMLElement>(null);
+  const previewResizeHandleRef = useRef<HTMLDivElement>(null);
+  const previewDragStart = useRef<{ y: number; height: number } | null>(null);
+  const savedPreviewHeight = Number(localStorage.getItem(PREVIEW_HEIGHT_STORAGE_KEY));
+  const [previewHeight, setPreviewHeight] = useState<number | null>(() =>
+    Number.isFinite(savedPreviewHeight) && savedPreviewHeight >= MIN_PREVIEW_HEIGHT
+      ? Math.min(MAX_PREVIEW_HEIGHT, savedPreviewHeight)
+      : null,
+  );
+  const [isResizingPreview, setIsResizingPreview] = useState(false);
   const [collectionPages, setCollectionPages] = useState<MediaRecord[]>([]);
   const [collectionIndex, setCollectionIndex] = useState(0);
 
@@ -66,6 +80,42 @@ export default function Inspector() {
   useEffect(() => {
     setOperationStatus(null);
   }, [media?.id, selectedIds]);
+
+  useEffect(() => {
+    if (previewHeight == null) {
+      localStorage.removeItem(PREVIEW_HEIGHT_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(PREVIEW_HEIGHT_STORAGE_KEY, String(previewHeight));
+  }, [previewHeight]);
+
+  useEffect(() => {
+    if (!isResizingPreview) return;
+
+    const resize = (event: PointerEvent) => {
+      const start = previewDragStart.current;
+      if (!start) return;
+      const inspectorHeight = inspectorRef.current?.clientHeight ?? window.innerHeight;
+      const viewportLimit = Math.max(MIN_PREVIEW_HEIGHT, inspectorHeight - 120);
+      const maxHeight = Math.min(MAX_PREVIEW_HEIGHT, viewportLimit);
+      setPreviewHeight(Math.min(maxHeight, Math.max(MIN_PREVIEW_HEIGHT, start.height + event.clientY - start.y)));
+    };
+    const stop = () => {
+      previewDragStart.current = null;
+      setIsResizingPreview(false);
+    };
+
+    document.body.classList.add("is-resizing-preview");
+    window.addEventListener("pointermove", resize);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    return () => {
+      document.body.classList.remove("is-resizing-preview");
+      window.removeEventListener("pointermove", resize);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+    };
+  }, [isResizingPreview]);
 
   useEffect(() => {
     setCollectionIndex(0);
@@ -250,8 +300,8 @@ export default function Inspector() {
   }
 
   return (
-    <aside className="inspector">
-      <div className="preview" onDoubleClick={openViewer}>
+    <aside ref={inspectorRef} className="inspector">
+      <div className="preview" style={{ height: previewHeight == null ? "calc(50% - 4.5px)" : previewHeight }} onDoubleClick={openViewer}>
         <button className="expand" onClick={openViewer}><Maximize2 size={16} /></button>
         {media.mediaType === "video"
           ? <video ref={videoRef} src={url} controls autoPlay={isAnimatedGif} loop={isAnimatedGif} muted={isAnimatedGif} playsInline onLoadedMetadata={(event) => { if (isAnimatedGif) void event.currentTarget.play().catch(() => undefined); }} />
@@ -262,6 +312,34 @@ export default function Inspector() {
           <span className="collectionCounter">{collectionIndex + 1} / {collectionPages.length}</span>
         </>}
       </div>
+      <div
+        ref={previewResizeHandleRef}
+        className="previewResizeHandle"
+        role="separator"
+        aria-label="Resize image and video preview"
+        aria-orientation="horizontal"
+        aria-valuemin={MIN_PREVIEW_HEIGHT}
+        aria-valuemax={MAX_PREVIEW_HEIGHT}
+        aria-valuenow={Math.round(previewHeight ?? (inspectorRef.current?.clientHeight ?? MIN_PREVIEW_HEIGHT * 2) / 2)}
+        tabIndex={0}
+        onPointerDown={(event) => {
+          event.preventDefault();
+          previewDragStart.current = { y: event.clientY, height: event.currentTarget.previousElementSibling?.getBoundingClientRect().height ?? MIN_PREVIEW_HEIGHT };
+          setIsResizingPreview(true);
+        }}
+        onDoubleClick={() => {
+          setPreviewHeight(null);
+          localStorage.removeItem(PREVIEW_HEIGHT_STORAGE_KEY);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+          event.preventDefault();
+          setPreviewHeight((height) => {
+            const currentHeight = height ?? previewResizeHandleRef.current?.previousElementSibling?.getBoundingClientRect().height ?? MIN_PREVIEW_HEIGHT;
+            return Math.min(MAX_PREVIEW_HEIGHT, Math.max(MIN_PREVIEW_HEIGHT, currentHeight + (event.key === "ArrowDown" ? 20 : -20)));
+          });
+        }}
+      />
 
       <div className="inspectorBody">
         <div className="inspectorTitle">

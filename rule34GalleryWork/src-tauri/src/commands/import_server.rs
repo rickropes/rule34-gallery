@@ -130,6 +130,8 @@ pub(crate) fn enqueue_import_with_refresh(app: &AppHandle, payload: ImportReques
     let url = Url::parse(payload.url.trim()).map_err(|e| format!("Invalid URL: {e}"))?;
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let is_rule34 = host == "rule34.xxx" || host == "www.rule34.xxx";
+    let is_danbooru = host == "danbooru.donmai.us" || host == "www.danbooru.donmai.us";
+    let is_gelbooru = host == "gelbooru.com" || host == "www.gelbooru.com";
     let is_x = matches!(host.as_str(), "x.com" | "www.x.com" | "twitter.com" | "www.twitter.com");
     let is_collection = payload.site.as_deref() == Some("collection");
 
@@ -137,6 +139,16 @@ pub(crate) fn enqueue_import_with_refresh(app: &AppHandle, payload: ImportReques
         let is_post = url.query_pairs().any(|(key, value)| key == "page" && value == "post")
             && url.query_pairs().any(|(key, value)| key == "s" && value == "view");
         if !is_post { return Err("Open an individual Rule34 post page before importing.".to_string()); }
+    } else if is_danbooru {
+        let mut segments = url.path_segments().into_iter().flatten();
+        let is_post = segments.next() == Some("posts")
+            && segments.next().map(|value| value.chars().all(|ch| ch.is_ascii_digit())).unwrap_or(false);
+        if !is_post { return Err("Open an individual Danbooru post page before importing.".to_string()); }
+    } else if is_gelbooru {
+        let is_post = url.query_pairs().any(|(key, value)| key == "page" && value == "post")
+            && url.query_pairs().any(|(key, value)| key == "s" && value == "view")
+            && url.query_pairs().any(|(key, value)| key == "id" && !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()));
+        if !is_post { return Err("Open an individual Gelbooru post page before importing.".to_string()); }
     } else if is_x {
         if !url.path().contains("/status/") {
             return Err("Right-click an individual X/Twitter post before importing.".to_string());
@@ -153,7 +165,7 @@ pub(crate) fn enqueue_import_with_refresh(app: &AppHandle, payload: ImportReques
             return Err("Add metadata before importing this new collection. Metadata can be omitted only when this gallery already exists in the library.".to_string());
         }
     } else {
-        return Err("Only Rule34, X/Twitter, and extension collection payloads are supported.".to_string());
+        return Err("Only Rule34, Danbooru, Gelbooru, X/Twitter, and extension collection payloads are supported.".to_string());
     }
 
     let state = app.state::<AppState>();
@@ -169,7 +181,11 @@ pub(crate) fn enqueue_import_with_refresh(app: &AppHandle, payload: ImportReques
     thread::spawn(move || {
         set_job(&worker_app, id, "fetching", None);
         let result = if is_rule34 {
-            process_rule34_import(&worker_app, id, &url)
+            process_booru_import(&worker_app, id, &url, BooruSite::Rule34)
+        } else if is_danbooru {
+            process_booru_import(&worker_app, id, &url, BooruSite::Danbooru)
+        } else if is_gelbooru {
+            process_booru_import(&worker_app, id, &url, BooruSite::Gelbooru)
         } else if is_x {
             process_x_import(&worker_app, id, &url, payload.artist.unwrap_or_default(), payload.media_urls, payload.media_types)
         } else {
@@ -197,11 +213,32 @@ fn set_job(app: &AppHandle, id: u64, status: &str, message: Option<String>) {
     let _ = app.emit("import-queue-updated", ());
 }
 
-fn process_rule34_import(app: &AppHandle, job_id: u64, page_url: &Url) -> Result<String, String> {
+#[derive(Clone, Copy)]
+enum BooruSite {
+    Rule34,
+    Danbooru,
+    Gelbooru,
+}
+
+impl BooruSite {
+    fn source_name(self) -> &'static str {
+        match self {
+            Self::Rule34 => "rule34.xxx",
+            Self::Danbooru => "danbooru.donmai.us",
+            Self::Gelbooru => "gelbooru.com",
+        }
+    }
+}
+
+fn process_booru_import(app: &AppHandle, job_id: u64, page_url: &Url, site: BooruSite) -> Result<String, String> {
     let client = Client::builder().user_agent("Rule34Library/0.1 (+local desktop importer)").build().map_err(|e| e.to_string())?;
     let html = client.get(page_url.clone()).send().map_err(|e| format!("Failed to fetch post page: {e}"))?
         .error_for_status().map_err(|e| format!("Post page returned an error: {e}"))?.text().map_err(|e| format!("Failed to read post page: {e}"))?;
-    let parsed = parse_rule34_page(page_url.clone(), &html)?;
+    let parsed = match site {
+        BooruSite::Rule34 => parse_rule34_page(page_url.clone(), &html)?,
+        BooruSite::Danbooru => parse_danbooru_page(page_url.clone(), &html)?,
+        BooruSite::Gelbooru => parse_gelbooru_page(page_url.clone(), &html)?,
+    };
 
     set_job(app, job_id, "downloading", None);
     let response = client
@@ -211,12 +248,7 @@ fn process_rule34_import(app: &AppHandle, job_id: u64, page_url: &Url) -> Result
         .map_err(|e| format!("Failed to download media: {e}"))?
         .error_for_status()
         .map_err(|e| format!("Media download returned an error: {e}"))?;
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
+    let content_type = response.headers().get(CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("").to_owned();
     let bytes = response.bytes().map_err(|e| format!("Failed to read media download: {e}"))?;
     let extension = media_extension(&parsed.media_url, &content_type)?;
     let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
@@ -230,7 +262,7 @@ fn process_rule34_import(app: &AppHandle, job_id: u64, page_url: &Url) -> Result
     let (media_id, imported) = import_downloaded_media(&temp, &root, connection)?;
 
     let tx = connection.transaction().map_err(|e| e.to_string())?;
-    tx.execute("INSERT OR IGNORE INTO sources(media_id,site,post_id,url,imported_at) VALUES(?1,'rule34.xxx',?2,?3,datetime('now'))", params![media_id, parsed.post_id, parsed.page_url.as_str()]).map_err(|e| e.to_string())?;
+    tx.execute("INSERT OR IGNORE INTO sources(media_id,site,post_id,url,imported_at) VALUES(?1,?2,?3,?4,datetime('now'))", params![media_id, site.source_name(), parsed.post_id, parsed.page_url.as_str()]).map_err(|e| e.to_string())?;
     for (category, name) in &parsed.tags {
         tx.execute("INSERT INTO tags(name,category) VALUES(?1,?2) ON CONFLICT(name,category) DO NOTHING", params![name, category]).map_err(|e| e.to_string())?;
         let tag_id:i64 = tx.query_row("SELECT id FROM tags WHERE name=?1 COLLATE NOCASE AND category=?2 COLLATE NOCASE", params![name, category], |row| row.get(0)).map_err(|e| e.to_string())?;
@@ -651,6 +683,121 @@ fn attach_metadata_tag(connection: &mut rusqlite::Connection, media_id: i64, nam
     tx.execute("INSERT OR IGNORE INTO media_tags(media_id,tag_id) VALUES(?1,?2)", params![media_id, tag_id]).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn parse_danbooru_page(page_url: Url, html: &str) -> Result<ParsedPost, String> {
+    let document = Html::parse_document(html);
+    let mut tags = Vec::new();
+    let mut seen_tags = HashSet::new();
+    for (selector_text, category) in [
+        ("ul.artist-tag-list li[data-tag-name]", "artist"),
+        ("ul.copyright-tag-list li[data-tag-name]", "copyright"),
+        ("ul.character-tag-list li[data-tag-name]", "character"),
+        ("ul.general-tag-list li[data-tag-name]", "general"),
+        ("ul.meta-tag-list li[data-tag-name]", "metadata"),
+    ] {
+        let selector = Selector::parse(selector_text).unwrap();
+        for item in document.select(&selector) {
+            let Some(raw_name) = item.value().attr("data-tag-name") else { continue; };
+            let name = raw_name.trim();
+            if name.is_empty() { continue; }
+            let key = format!("{}\0{}", category, name.to_ascii_lowercase());
+            if seen_tags.insert(key) { tags.push((category.to_string(), name.to_string())); }
+        }
+    }
+
+    let media_selectors = [
+        "a#image-download-link[href]",
+        "a#image-resize-link[href]",
+        "video#image source[src]",
+        "video#image[src]",
+        "img#image[data-original-file-url]",
+        "img#image[data-file-url]",
+        "img#image[src]",
+        "meta[property='og:image'][content]",
+        "meta[property='og:video'][content]",
+    ];
+    let mut media_src = None;
+    for selector_text in media_selectors {
+        let selector = Selector::parse(selector_text).unwrap();
+        if let Some(node) = document.select(&selector).next() {
+            media_src = node.value().attr("href")
+                .or_else(|| node.value().attr("src"))
+                .or_else(|| node.value().attr("data-original-file-url"))
+                .or_else(|| node.value().attr("data-file-url"))
+                .or_else(|| node.value().attr("content"))
+                .map(str::to_string);
+            if media_src.is_some() { break; }
+        }
+    }
+    let media_src = media_src.ok_or_else(|| "Could not find the original Danbooru image or video on the post page.".to_string())?;
+    let media_url = page_url.join(&media_src).map_err(|e| format!("Invalid media URL: {e}"))?;
+    let post_id = page_url.path_segments().into_iter().flatten().nth(1).unwrap_or(page_url.path()).to_string();
+    Ok(ParsedPost { page_url, media_url, tags, post_id })
+}
+
+fn parse_gelbooru_page(page_url: Url, html: &str) -> Result<ParsedPost, String> {
+    let document = Html::parse_document(html);
+    let anchor_selector = Selector::parse("a[href]").unwrap();
+    let mut tags = Vec::new();
+    let mut seen_tags = HashSet::new();
+
+    for (class_name, category) in [
+        ("tag-type-artist", "artist"),
+        ("tag-type-copyright", "copyright"),
+        ("tag-type-character", "character"),
+        ("tag-type-general", "general"),
+        ("tag-type-metadata", "metadata"),
+    ] {
+        let selector = Selector::parse(&format!("#tag-list li.{class_name}")).unwrap();
+        for item in document.select(&selector) {
+            let name = item
+                .select(&anchor_selector)
+                .find(|anchor| {
+                    anchor.value().attr("href").map(|href| {
+                        href.contains("page=post") && href.contains("s=list") && href.contains("tags=")
+                    }).unwrap_or(false)
+                })
+                .map(|anchor| anchor.text().collect::<String>().trim().to_string());
+            let Some(name) = name else { continue; };
+            if name.is_empty() { continue; }
+            let canonical = item
+                .select(&anchor_selector)
+                .find_map(|anchor| anchor.value().attr("href"))
+                .and_then(|href| Url::parse(&format!("https://gelbooru.com/{href}")).ok())
+                .and_then(|url| url.query_pairs().find(|(key, _)| key == "tags").map(|(_, value)| value.into_owned()))
+                .unwrap_or_else(|| name.replace(' ', "_"));
+            let key = format!("{}\0{}", category, canonical.to_ascii_lowercase());
+            if seen_tags.insert(key) { tags.push((category.to_string(), canonical)); }
+        }
+    }
+
+    let original_link = document.select(&anchor_selector).find_map(|anchor| {
+        let href = anchor.value().attr("href")?;
+        let text = anchor.text().collect::<String>().trim().to_ascii_lowercase();
+        let lower = href.to_ascii_lowercase();
+        let looks_like_media = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".webm", ".mov", ".m4v"]
+            .iter().any(|ext| lower.split(['?', '#']).next().unwrap_or(&lower).ends_with(ext));
+        ((text.contains("original image") || looks_like_media) && !lower.contains("thumbnail")).then(|| href.to_string())
+    });
+
+    let media_src = original_link.or_else(|| {
+        for selector_text in ["video source[src]", "video[src]", "img#image[src]", "meta[property='og:video'][content]", "meta[property='og:image'][content]"] {
+            let selector = Selector::parse(selector_text).unwrap();
+            if let Some(node) = document.select(&selector).next() {
+                if let Some(value) = node.value().attr("src").or_else(|| node.value().attr("content")) {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
+    }).ok_or_else(|| "Could not find the original Gelbooru image or video on the post page.".to_string())?;
+
+    let media_url = page_url.join(&media_src).map_err(|e| format!("Invalid media URL: {e}"))?;
+    let post_id = page_url.query_pairs().find(|(key, _)| key == "id")
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| "Could not determine the Gelbooru post ID.".to_string())?;
+    Ok(ParsedPost { page_url, media_url, tags, post_id })
 }
 
 fn parse_rule34_page(page_url: Url, html: &str) -> Result<ParsedPost, String> {

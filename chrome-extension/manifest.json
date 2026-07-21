@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Gallery Post Importer",
-  "version": "0.6.1",
-  "description": "Send Rule34, X/Twitter, and browser-managed image collections to the local gallery app.",
+  "version": "0.8.0",
+  "description": "Send Rule34, Danbooru, Gelbooru, X/Twitter, and browser-managed image collections to the local gallery app.",
   "permissions": [
     "contextMenus",
     "notifications",
@@ -13,6 +13,10 @@
     "http://127.0.0.1:37891/*",
     "https://rule34.xxx/*",
     "https://www.rule34.xxx/*",
+    "https://danbooru.donmai.us/*",
+    "https://www.danbooru.donmai.us/*",
+    "https://gelbooru.com/*",
+    "https://www.gelbooru.com/*",
     "https://x.com/*",
     "https://www.x.com/*",
     "https://twitter.com/*",
@@ -23,9 +27,7 @@
     "https://e-hentai.org/*",
     "https://*.e-hentai.org/*",
     "https://exhentai.org/*",
-    "https://*.exhentai.org/*",
-    "https://script.google.com/*",
-    "https://script.googleusercontent.com/*"
+    "https://*.exhentai.org/*"
   ],
   "background": {
     "service_worker": "background.js"

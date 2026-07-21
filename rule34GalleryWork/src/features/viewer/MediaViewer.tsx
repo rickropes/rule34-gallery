@@ -12,6 +12,8 @@ export default function MediaViewer() {
   const media = useAppStore((s) => s.selectedMedia);
   const open = useAppStore((s) => s.viewerOpen);
   const setOpen = useAppStore((s) => s.setViewerOpen);
+  const galleryMedia = useAppStore((s) => s.galleryMedia);
+  const setSelectedMedia = useAppStore((s) => s.setSelectedMedia);
   const [scale, setScale] = useState(1);
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const [videoPaused, setVideoPaused] = useState(false);
@@ -22,6 +24,19 @@ export default function MediaViewer() {
   const viewerRef = useRef<HTMLDivElement>(null);
   const { tags } = useMediaTags(media?.id ?? null);
   const isAnimatedGif = tags.some((tag) => tag.category.toLowerCase() === "metadata" && tag.name.toLowerCase() === "animated_gif");
+  const galleryIndex = media ? galleryMedia.findIndex((item) => item.id === media.id) : -1;
+  const hasPreviousPost = galleryIndex > 0;
+  const hasNextPost = galleryIndex >= 0 && galleryIndex < galleryMedia.length - 1;
+
+  function navigatePost(direction: -1 | 1) {
+    if (galleryIndex < 0) return;
+    const next = galleryMedia[galleryIndex + direction];
+    if (!next) return;
+    setSelectedMedia(next);
+    setCollectionPages([]);
+    setCollectionIndex(0);
+    reset();
+  }
 
   useEffect(() => {
     setScale(1);
@@ -41,16 +56,16 @@ export default function MediaViewer() {
       if (event.key === "Escape") setOpen(false);
       if (event.key === "+") setScale((value) => Math.min(8, value + 0.25));
       if (event.key === "-") setScale((value) => Math.max(0.2, value - 0.25));
-      if (collectionPages.length > 1 && event.key === "ArrowLeft") { setCollectionIndex((value) => (value - 1 + collectionPages.length) % collectionPages.length); reset(); return; }
-      if (collectionPages.length > 1 && event.key === "ArrowRight") { setCollectionIndex((value) => (value + 1) % collectionPages.length); reset(); return; }
+      if (event.key === "ArrowLeft") { event.preventDefault(); navigatePost(-1); return; }
+      if (event.key === "ArrowRight") { event.preventDefault(); navigatePost(1); return; }
       if (media?.mediaType === "video" && videoRef.current?.paused) {
-        if (event.key === "," || event.key === "ArrowLeft") stepFrame(-1);
-        if (event.key === "." || event.key === "ArrowRight") stepFrame(1);
+        if (event.key === ",") stepFrame(-1);
+        if (event.key === ".") stepFrame(1);
       }
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [open, media?.mediaType, setOpen, collectionPages.length]);
+  }, [open, media?.mediaType, setOpen, galleryIndex, galleryMedia]);
 
   if (!media || !open) return null;
   const activeMedia = collectionPages[collectionIndex] ?? media;
@@ -99,6 +114,22 @@ export default function MediaViewer() {
         <button onClick={() => viewerRef.current?.requestFullscreen?.()} title="Fullscreen"><Maximize /></button>
         <button onClick={() => setOpen(false)} title="Close"><X /></button>
       </div>
+      <button
+        className="viewerPostNav viewerPostNavPrevious"
+        type="button"
+        title="Previous post (Left arrow)"
+        aria-label="Previous post"
+        disabled={!hasPreviousPost}
+        onClick={(event) => { event.stopPropagation(); navigatePost(-1); }}
+      ><ChevronLeft /></button>
+      <button
+        className="viewerPostNav viewerPostNavNext"
+        type="button"
+        title="Next post (Right arrow)"
+        aria-label="Next post"
+        disabled={!hasNextPost}
+        onClick={(event) => { event.stopPropagation(); navigatePost(1); }}
+      ><ChevronRight /></button>
       <div
         className="viewerStage"
         onClick={(event) => event.stopPropagation()}

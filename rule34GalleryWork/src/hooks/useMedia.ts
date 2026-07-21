@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { mediaProvider } from "@/providers/mediaProvider";
 import { useAppStore } from "@/store/appStore";
 import type { MediaRecord } from "@/types/media";
+import { BOARDS_CHANGED } from "@/services/boardService";
 
 const PAGE_SIZE = 80;
 
@@ -15,12 +16,19 @@ export function useMedia() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [boardVersion, setBoardVersion] = useState(0);
   const requestId = useRef(0);
   const loadedCountRef = useRef(0);
 
   useEffect(() => {
     loadedCountRef.current = media.length;
   }, [media.length]);
+
+  useEffect(() => {
+    const refreshBoards = () => setBoardVersion((value) => value + 1);
+    window.addEventListener(BOARDS_CHANGED, refreshBoards);
+    return () => window.removeEventListener(BOARDS_CHANGED, refreshBoards);
+  }, []);
 
   const loadFirstPage = useCallback(async () => {
     const id = ++requestId.current;
@@ -49,7 +57,7 @@ export function useMedia() {
     } finally {
       if (id === requestId.current) setLoading(false);
     }
-  }, [search, from, to, version]);
+  }, [search, from, to, version, boardVersion]);
 
   const loadMore = useCallback(async () => {
     if (loading || loadingMore || media.length >= total) return;

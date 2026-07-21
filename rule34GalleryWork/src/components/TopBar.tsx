@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
-import { Search, Link as LinkIcon, Upload, CalendarDays, Smartphone } from "lucide-react";
+import { Link, useLocation } from "react-router-dom";
+import { Search, Link as LinkIcon, Upload, CalendarDays, Smartphone, LayoutDashboard, Images } from "lucide-react";
 import { selectAndImportMedia } from "@/services/importService";
 import { importMediaUrl, listSearchSuggestions } from "@/tauri/mediaApi";
 import { syncMobileQueue } from "@/tauri/mobileQueueApi";
 import { useAppStore } from "@/store/appStore";
+import { loadBoards } from "@/services/boardService";
 
 function activeSearchToken(value: string) {
   const match = value.match(/(?:^|\s)(-?"?[^^\s"]*)$/);
@@ -12,6 +13,8 @@ function activeSearchToken(value: string) {
 }
 
 export default function TopBar() {
+  const location=useLocation();
+  const inBoards=location.pathname.startsWith("/boards");
   const search=useAppStore(s=>s.search), setSearch=useAppStore(s=>s.setSearch);
   const from=useAppStore(s=>s.addedFrom), to=useAppStore(s=>s.addedTo);
   const setFrom=useAppStore(s=>s.setAddedFrom), setTo=useAppStore(s=>s.setAddedTo), bump=useAppStore(s=>s.bumpLibraryVersion);
@@ -24,6 +27,11 @@ export default function TopBar() {
   useEffect(()=>{
     const id=window.setTimeout(async()=>{
       const plain=token.replace(/^-/,"").replace(/^"/,"");
+      const boardNeedle=plain.toLowerCase().startsWith("board:")?plain.slice(6).toLowerCase():null;
+      if(boardNeedle!==null){
+        setSuggestions(loadBoards().filter(board=>board.name.toLowerCase().includes(boardNeedle)).slice(0,24).map(board=>`board:${board.name}`));
+        return;
+      }
       if(!plain){setSuggestions([]);return;}
       try{setSuggestions(await listSearchSuggestions(plain));}catch{setSuggestions([]);}
     },120);
@@ -50,7 +58,7 @@ export default function TopBar() {
   return <>
     <header className="topbar">
       <div className="searchWrap" ref={searchWrap}>
-        <div className="searchBox"><Search size={17}/><input value={search} onFocus={()=>setShowSuggestions(true)} onChange={e=>{setSearch(e.target.value);setShowSuggestions(true);}} placeholder='Search tags, e.g. -"metadata:gif" bigSize:2000'/></div>
+        <div className="searchBox"><Search size={17}/><input value={search} onFocus={()=>setShowSuggestions(true)} onChange={e=>{setSearch(e.target.value);setShowSuggestions(true);}} placeholder='Search tags, e.g. board:Mod App 1 or -"board:Mod App 1"'/></div>
         {showSuggestions&&suggestions.length>0&&<div className="searchSuggestions">
           {suggestions.map(value=><button key={value} type="button" onPointerDown={e=>e.preventDefault()} onClick={()=>chooseSuggestion(value)}>{value.includes(":")?<><b>{value.split(":",1)[0]}</b>:{value.slice(value.indexOf(":")+1)}</>:<><b>{value}</b><span>category</span></>}</button>)}
         </div>}
@@ -60,6 +68,7 @@ export default function TopBar() {
         <button onClick={()=>setShowUrl(v=>!v)}><LinkIcon size={16}/> Add URL</button>
         <button disabled={busy} onClick={()=>void syncMobile()}><Smartphone size={16}/> Mobile queue</button>
         <button className="primary" disabled={busy} onClick={()=>void importFiles()}><Upload size={16}/> Import files</button>
+        {inBoards?<Link className="button" to="/"><Images size={16}/> Gallery</Link>:<Link className="button" to="/boards"><LayoutDashboard size={16}/> Boards</Link>}
         <Link className="button" to="/settings">Settings</Link>
       </div>
     </header>

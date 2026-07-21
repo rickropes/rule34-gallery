@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import RustStatus from "./RustStatus";
 import { useAppStore } from "@/store/appStore";
 import { getMediaCount } from "@/tauri/libraryApi";
 import { listImportQueue, type ImportJob } from "@/tauri/importQueueApi";
@@ -41,7 +40,6 @@ export default function StatusBar() {
 
   return (
     <footer className="flex h-8 items-center justify-between gap-4 border-t border-zinc-800 bg-zinc-900 px-4 text-xs text-zinc-400">
-      <RustStatus />
       <span className="min-w-0 flex-1 truncate text-center" title={queueLabel}>{queueLabel}</span>
       <span title={countError ?? undefined}>{countLabel}</span>
       <span className="max-w-72 truncate" title={libraryPath ?? undefined}>{libraryPath ?? "No library"}</span>

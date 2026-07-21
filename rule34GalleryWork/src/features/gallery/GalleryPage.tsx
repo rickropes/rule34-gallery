@@ -11,6 +11,7 @@ export default function GalleryPage() {
   const { media, total, loading, loadingMore, error, refresh, loadMore, hasMore } = useMedia();
   const search = useAppStore((s) => s.search);
   const selected = useAppStore((s) => s.selectedIds.length);
+  const setGalleryMedia = useAppStore((s) => s.setGalleryMedia);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [viewportWidth, setViewportWidth] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
@@ -44,6 +45,10 @@ export default function GalleryPage() {
     frame = requestAnimationFrame(measureContinuously);
     return () => cancelAnimationFrame(frame);
   }, []);
+
+  useEffect(() => {
+    setGalleryMedia(media);
+  }, [media, setGalleryMedia]);
 
   useEffect(() => {
     viewportRef.current?.scrollTo({ top: 0 });
@@ -87,7 +92,7 @@ export default function GalleryPage() {
   if (error && media.length === 0) return <div className="state error">Failed to load: {error}<button onClick={() => void refresh()}>Retry</button></div>;
 
   return <div className="galleryPage">
-    <div className="pageHeading"><div><h1>Gallery</h1><p>{total} result{total===1?"":"s"}{search?` for “${search}”`:""}{selected>1?` · ${selected} selected`:""}</p></div></div>
+    <div className="pageHeading"><div><p>{total} result{total===1?"":"s"}{search?` for “${search}”`:""}{selected>1?` · ${selected} selected`:""}</p></div></div>
     {media.length===0?<div className="state">No media matches. Import files or change the filters.</div>:<>
       <div ref={viewportRef} className="galleryVirtualViewport" onScroll={handleScroll}>
         <div className="galleryVirtualCanvas" style={{ height: totalHeight }}>

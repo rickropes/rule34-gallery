@@ -86,7 +86,7 @@ fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
         WebviewUrl::App("index.html".into()),
     )
     .title("rule34-library")
-    .inner_size(1280.0, 980.0)
+    .inner_size(1500.0, 1100.0)
     .min_inner_size(640.0, 480.0)
     .visible(false)
     .build()?;
