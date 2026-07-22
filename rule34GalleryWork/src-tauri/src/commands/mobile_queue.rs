@@ -167,6 +167,20 @@ fn sync_mobile_queue_blocking(app: AppHandle) -> Result<MobileSyncResult, String
 }
 
 
+pub fn start_mobile_queue_worker(app: AppHandle) {
+    std::thread::spawn(move || {
+        // Give startup library initialization a moment to finish, then process
+        // immediately and continue while the tray application is alive.
+        std::thread::sleep(Duration::from_secs(2));
+        loop {
+            if let Err(error) = sync_mobile_queue_blocking(app.clone()) {
+                eprintln!("Background mobile queue sync failed: {error}");
+            }
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn sync_mobile_queue(app: AppHandle) -> Result<MobileSyncResult, String> {
     tauri::async_runtime::spawn_blocking(move || sync_mobile_queue_blocking(app))

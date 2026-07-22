@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
-    path::Path,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
     process::Command,
     sync::atomic::Ordering,
     thread,
@@ -12,11 +14,12 @@ use rusqlite::{params, OptionalExtension};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use image::{DynamicImage, RgbaImage};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 use url::Url;
 
-use crate::{commands::media::import_downloaded_media, state::{AppState, ImportJob}};
+use crate::{commands::media::{import_downloaded_media, is_valid_tag_name}, state::{AppState, ImportJob}};
 
 const LISTEN_ADDRESS: &str = "127.0.0.1:37891";
 
@@ -264,6 +267,7 @@ fn process_booru_import(app: &AppHandle, job_id: u64, page_url: &Url, site: Boor
     let tx = connection.transaction().map_err(|e| e.to_string())?;
     tx.execute("INSERT OR IGNORE INTO sources(media_id,site,post_id,url,imported_at) VALUES(?1,?2,?3,?4,datetime('now'))", params![media_id, site.source_name(), parsed.post_id, parsed.page_url.as_str()]).map_err(|e| e.to_string())?;
     for (category, name) in &parsed.tags {
+        if !is_valid_tag_name(name) { continue; }
         tx.execute("INSERT INTO tags(name,category) VALUES(?1,?2) ON CONFLICT(name,category) DO NOTHING", params![name, category]).map_err(|e| e.to_string())?;
         let tag_id:i64 = tx.query_row("SELECT id FROM tags WHERE name=?1 COLLATE NOCASE AND category=?2 COLLATE NOCASE", params![name, category], |row| row.get(0)).map_err(|e| e.to_string())?;
         tx.execute("INSERT OR IGNORE INTO media_tags(media_id,tag_id) VALUES(?1,?2)", params![media_id, tag_id]).map_err(|e| e.to_string())?;
@@ -393,6 +397,7 @@ fn process_collection_import(
         let mut tags=value.tags;
         tags.push(CollectionTag{category:"metadata".into(),name:"comic_hentai".into()});
         for tag in tags {
+            if !is_valid_tag_name(&tag.name) { continue; }
             let category=tag.category.trim(); let name=tag.name.trim();
             if category.is_empty()||name.is_empty(){continue}
             tx.execute("INSERT INTO tags(name,category) VALUES(?1,?2) ON CONFLICT(name,category) DO NOTHING",params![name,category]).map_err(|e|e.to_string())?;
@@ -443,16 +448,43 @@ fn process_x_import(
     let post_id = x_post_id(page_url);
     let mut imported_count = 0usize;
 
-    if !images.is_empty() {
-        let temp = if images.len() == 1 {
-            write_temp_media("x-image", &images[0].0, &images[0].1, &images[0].2)?
-        } else {
-            merge_images_compact(&images)?
-        };
+    if images.len() == 1 {
+        let temp = write_temp_media("x-image", &images[0].0, &images[0].1, &images[0].2)?;
         let (media_id, _) = import_downloaded_media(&temp, &root, connection)?;
         attach_source_and_artist(connection, media_id, page_url, &post_id, &artist)?;
         let _ = std::fs::remove_file(temp);
         imported_count += 1;
+    } else if images.len() > 1 {
+        let mut page_ids = Vec::with_capacity(images.len());
+        for (index, (url, bytes, content_type)) in images.iter().enumerate() {
+            set_job(app, job_id, "saving", Some(format!("Saving comic page {} of {}", index + 1, images.len())));
+            let temp = write_temp_media("x-comic-page", url, bytes, content_type)?;
+            let (media_id, imported) = import_downloaded_media(&temp, &root, connection)?;
+            let _ = std::fs::remove_file(&temp);
+            if imported {
+                attach_source_and_artist(connection, media_id, page_url, &post_id, &artist)?;
+                page_ids.push(media_id);
+            }
+        }
+        if page_ids.len() < 2 {
+            imported_count += page_ids.len();
+        } else {
+            let title = format!("X post by @{}", artist.trim_start_matches('@'));
+            connection.execute(
+                "INSERT INTO collections(collection_type,title,source_url,source_external_id,cover_media_id,created_at) VALUES('twitter_comic',?1,?2,?3,?4,datetime('now'))",
+                rusqlite::params![title, page_url.as_str(), post_id, page_ids[0]],
+            ).map_err(|e| format!("Failed to create X comic: {e}"))?;
+            let collection_id = connection.last_insert_rowid();
+            for (index, media_id) in page_ids.iter().enumerate() {
+                let position = index as i64 + 1;
+                connection.execute(
+                    "INSERT INTO collection_pages(collection_id,media_id,page_number,position) VALUES(?1,?2,?3,?3)",
+                    rusqlite::params![collection_id, media_id, position],
+                ).map_err(|e| format!("Failed to add X comic page: {e}"))?;
+            }
+            attach_metadata_tag(connection, page_ids[0], "comic_hentai")?;
+            imported_count += 1;
+        }
     }
 
     for (index, (url, bytes, content_type, is_animated_gif)) in videos.iter().enumerate() {
@@ -554,56 +586,22 @@ fn merge_images_compact(images: &[(Url, Vec<u8>, String)]) -> Result<std::path::
         return Err("No X images to merge.".to_string());
     }
 
-    // Try every practical column count and choose the grid whose final aspect
-    // ratio is closest to a square. Images stay in their original post order,
-    // laid out left-to-right and then top-to-bottom.
-    //
-    // This naturally makes two portrait images sit side by side, two landscape
-    // images stack vertically, and four similarly-sized images form a 2x2 grid.
+    // Use the same orientation-aware strip layout as the gallery merger.
+    // Mostly landscape images stack vertically; mostly portrait images sit
+    // horizontally. Ties use a vertical stack.
     let image_count = decoded.len();
-    let mut best: Option<(usize, usize, Vec<u32>, Vec<u32>, f64)> = None;
-
-    for columns in 1..=image_count {
-        let rows = (image_count + columns - 1) / columns;
-        let mut column_widths = vec![0u32; columns];
-        let mut row_heights = vec![0u32; rows];
-
-        for (index, image) in decoded.iter().enumerate() {
-            let column = index % columns;
-            let row = index / columns;
-            column_widths[column] = column_widths[column].max(image.width());
-            row_heights[row] = row_heights[row].max(image.height());
-        }
-
-        let canvas_width: u64 = column_widths.iter().map(|&value| u64::from(value)).sum();
-        let canvas_height: u64 = row_heights.iter().map(|&value| u64::from(value)).sum();
-        if canvas_width == 0 || canvas_height == 0 {
-            continue;
-        }
-
-        let aspect = canvas_width as f64 / canvas_height as f64;
-        let square_distance = aspect.ln().abs();
-        let empty_cells = rows * columns - image_count;
-
-        // A nearly square canvas is useful, but a heavily ragged grid is not.
-        // Penalize every unused slot enough that four equally sized portrait
-        // images choose a complete 2x2 grid instead of a 3+1 arrangement.
-        // The normalized term keeps the rule proportional for larger posts.
-        let empty_penalty = empty_cells as f64 * 0.16;
-        let ragged_penalty = if empty_cells == 0 {
-            0.0
-        } else {
-            empty_cells as f64 / (rows * columns) as f64 * 0.20
-        };
-        let score = square_distance + empty_penalty + ragged_penalty;
-
-        if best.as_ref().map(|entry| score < entry.4).unwrap_or(true) {
-            best = Some((columns, rows, column_widths, row_heights, score));
-        }
+    let landscape_count = decoded.iter().filter(|image| image.width() > image.height()).count();
+    let portrait_count = decoded.iter().filter(|image| image.height() > image.width()).count();
+    let columns = if portrait_count > landscape_count { image_count } else { 1 };
+    let rows = (image_count + columns - 1) / columns;
+    let mut column_widths = vec![0u32; columns];
+    let mut row_heights = vec![0u32; rows];
+    for (index, image) in decoded.iter().enumerate() {
+        let column = index % columns;
+        let row = index / columns;
+        column_widths[column] = column_widths[column].max(image.width());
+        row_heights[row] = row_heights[row].max(image.height());
     }
-
-    let (columns, _rows, column_widths, row_heights, _) =
-        best.ok_or_else(|| "Could not calculate an X image layout.".to_string())?;
 
     let canvas_width_u64: u64 = column_widths.iter().map(|&value| u64::from(value)).sum();
     let canvas_height_u64: u64 = row_heights.iter().map(|&value| u64::from(value)).sum();
@@ -633,21 +631,9 @@ fn merge_images_compact(images: &[(Url, Vec<u8>, String)]) -> Result<std::path::
         image::imageops::overlay(&mut canvas, &rgba, i64::from(x), i64::from(y));
     }
 
-    // Multi-image posts can produce very large canvases. Automatically reduce
-    // the completed merge to half of its composed width and height while
-    // preserving the layout and aspect ratio.
-    let output = if image_count >= 2 {
-        let resized_width = (canvas_width / 2).max(1);
-        let resized_height = (canvas_height / 2).max(1);
-        image::imageops::resize(
-            &canvas,
-            resized_width,
-            resized_height,
-            image::imageops::FilterType::Lanczos3,
-        )
-    } else {
-        canvas
-    };
+    // Preserve the full composed resolution; merged images are no longer
+    // automatically reduced to half size.
+    let output = canvas;
 
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -685,25 +671,157 @@ fn attach_metadata_tag(connection: &mut rusqlite::Connection, media_id: i64, nam
     Ok(())
 }
 
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReimportResult {
+    media_updated: bool,
+    metadata_updated: bool,
+    tag_count: usize,
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|e| e.to_string())?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn reimport_media_dir(root: &Path, media_type: &str) -> PathBuf {
+    root.join("media").join(if media_type == "video" { "videos" } else { "images" })
+}
+
+#[tauri::command]
+pub fn reimport_media(
+    media_id: i64,
+    media: bool,
+    metadata: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<ReimportResult, String> {
+    if !media && !metadata { return Err("Select Media, Metadata, or both.".to_string()); }
+    let root = state.library_path.lock().map_err(|_| "Failed to access library path.".to_string())?
+        .clone().ok_or_else(|| "Open a library before reimporting.".to_string())?;
+    let mut library = state.library_connection.lock().map_err(|_| "Failed to access library database.".to_string())?;
+    let connection = library.as_mut().ok_or_else(|| "Open a library before reimporting.".to_string())?;
+    let (source_url, old_stored, old_type): (String, String, String) = connection.query_row(
+        "SELECT s.url,m.stored_filename,m.media_type FROM media m JOIN sources s ON s.media_id=m.id WHERE m.id=?1 ORDER BY s.id DESC LIMIT 1",
+        [media_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).optional().map_err(|e| e.to_string())?.ok_or_else(|| "This item has no source link to reimport.".to_string())?;
+    let page_url = Url::parse(&source_url).map_err(|e| format!("Invalid source URL: {e}"))?;
+    let host = page_url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let site = if matches!(host.as_str(), "danbooru.donmai.us" | "www.danbooru.donmai.us") {
+        BooruSite::Danbooru
+    } else if matches!(host.as_str(), "gelbooru.com" | "www.gelbooru.com") {
+        BooruSite::Gelbooru
+    } else if matches!(host.as_str(), "rule34.xxx" | "www.rule34.xxx") {
+        BooruSite::Rule34
+    } else {
+        return Err("Reimport currently supports Rule34, Danbooru, and Gelbooru source links.".to_string());
+    };
+    let client = Client::builder().user_agent("Rule34Library/0.1 (+local desktop importer)").build().map_err(|e| e.to_string())?;
+    let html = client.get(page_url.clone()).send().map_err(|e| format!("Failed to fetch source page: {e}"))?
+        .error_for_status().map_err(|e| format!("Source page returned an error: {e}"))?.text().map_err(|e| e.to_string())?;
+    let parsed = match site {
+        BooruSite::Rule34 => parse_rule34_page(page_url.clone(), &html)?,
+        BooruSite::Danbooru => parse_danbooru_page(page_url.clone(), &html)?,
+        BooruSite::Gelbooru => parse_gelbooru_page(page_url.clone(), &html)?,
+    };
+
+    let mut new_file: Option<(PathBuf, String, String, String, Option<i64>, Option<i64>, i64)> = None;
+    if media {
+        let response = client.get(parsed.media_url.clone()).header(REFERER, parsed.page_url.as_str()).send()
+            .map_err(|e| format!("Failed to download media: {e}"))?.error_for_status().map_err(|e| format!("Media download returned an error: {e}"))?;
+        let content_type = response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
+        let bytes = response.bytes().map_err(|e| e.to_string())?;
+        if bytes.is_empty() { return Err("The source returned an empty media file.".to_string()); }
+        let extension = media_extension(&parsed.media_url, &content_type)?;
+        let media_type = match extension.as_str() {
+            "jpg"|"jpeg"|"png"|"webp"|"bmp"|"avif" => "image",
+            _ => "video",
+        }.to_string();
+        let temp = std::env::temp_dir().join(format!("reimport-{media_id}-{}.{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(), extension));
+        let mut file = std::fs::File::create(&temp).map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        let dimensions = if media_type == "image" {
+            let reader = image::ImageReader::open(&temp).map_err(|e| format!("Downloaded image could not be opened: {e}"))?
+                .with_guessed_format().map_err(|e| format!("Downloaded image format could not be detected: {e}"))?;
+            let decoded = reader.decode().map_err(|e| format!("Downloaded image is invalid: {e}"))?;
+            Some((i64::from(decoded.width()), i64::from(decoded.height())))
+        } else { None };
+        let hash = sha256_file(&temp)?;
+        let duplicate: Option<i64> = connection.query_row("SELECT id FROM media WHERE hash=?1 AND id<>?2", params![hash, media_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        if duplicate.is_some() { let _=fs::remove_file(&temp); return Err("The reimported media already exists as another library item.".to_string()); }
+        let stored = format!("{hash}.{extension}");
+        let dir = reimport_media_dir(&root, &media_type); fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let dest = dir.join(&stored); fs::rename(&temp, &dest).or_else(|_| { fs::copy(&temp,&dest).map(|_|()).and_then(|_|fs::remove_file(&temp)) }).map_err(|e| e.to_string())?;
+        let metadata_on_disk = fs::metadata(&dest).map_err(|e| format!("Reimported file was not written to the library: {e}"))?;
+        if !metadata_on_disk.is_file() || metadata_on_disk.len() == 0 {
+            let _ = fs::remove_file(&dest);
+            return Err("Reimported file validation failed after it was written to the library.".to_string());
+        }
+        let size = metadata_on_disk.len() as i64;
+        new_file = Some((dest, hash, stored, media_type, dimensions.map(|d|d.0), dimensions.map(|d|d.1), size));
+    }
+
+    let tx = connection.transaction().map_err(|e| e.to_string())?;
+    if let Some((_, hash, stored, media_type, width, height, size)) = &new_file {
+        let extension = Path::new(stored).extension().and_then(|v|v.to_str()).unwrap_or("");
+        tx.execute("UPDATE media SET hash=?1,stored_filename=?2,extension=?3,media_type=?4,width=?5,height=?6,filesize=?7 WHERE id=?8",
+            params![hash,stored,extension,media_type,width,height,size,media_id]).map_err(|e|e.to_string())?;
+    }
+    if metadata {
+        tx.execute("DELETE FROM media_tags WHERE media_id=?1", [media_id]).map_err(|e|e.to_string())?;
+        for (category,name) in &parsed.tags {
+            if !is_valid_tag_name(name) { continue; }
+            tx.execute("INSERT INTO tags(name,category) VALUES(?1,?2) ON CONFLICT(name,category) DO NOTHING", params![name,category]).map_err(|e|e.to_string())?;
+            let tag_id:i64=tx.query_row("SELECT id FROM tags WHERE name=?1 COLLATE NOCASE AND category=?2 COLLATE NOCASE",params![name,category],|r|r.get(0)).map_err(|e|e.to_string())?;
+            tx.execute("INSERT OR IGNORE INTO media_tags(media_id,tag_id) VALUES(?1,?2)",params![media_id,tag_id]).map_err(|e|e.to_string())?;
+        }
+    }
+    if let Err(error) = tx.commit() {
+        if let Some((new_path, ..)) = &new_file { let _ = fs::remove_file(new_path); }
+        return Err(format!("Failed to update the library database: {error}"));
+    }
+    if let Some((new_path, ..)) = &new_file {
+        if !new_path.is_file() || fs::metadata(new_path).map(|m| m.len()).unwrap_or(0) == 0 {
+            return Err("The database was updated, but the reimported media file is missing. The original file was preserved.".to_string());
+        }
+        let stored_after: String = connection.query_row("SELECT stored_filename FROM media WHERE id=?1", [media_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if new_path.file_name().and_then(|v| v.to_str()) != Some(stored_after.as_str()) {
+            return Err("Reimport verification failed because the database filename does not match the saved file. The original file was preserved.".to_string());
+        }
+        let old_path = reimport_media_dir(&root, &old_type).join(old_stored);
+        if old_path != *new_path { let _ = fs::remove_file(old_path); }
+    }
+    Ok(ReimportResult { media_updated: media, metadata_updated: metadata, tag_count: if metadata { parsed.tags.len() } else { 0 } })
+}
+
 fn parse_danbooru_page(page_url: Url, html: &str) -> Result<ParsedPost, String> {
     let document = Html::parse_document(html);
     let mut tags = Vec::new();
     let mut seen_tags = HashSet::new();
-    for (selector_text, category) in [
-        ("ul.artist-tag-list li[data-tag-name]", "artist"),
-        ("ul.copyright-tag-list li[data-tag-name]", "copyright"),
-        ("ul.character-tag-list li[data-tag-name]", "character"),
-        ("ul.general-tag-list li[data-tag-name]", "general"),
-        ("ul.meta-tag-list li[data-tag-name]", "metadata"),
-    ] {
-        let selector = Selector::parse(selector_text).unwrap();
-        for item in document.select(&selector) {
-            let Some(raw_name) = item.value().attr("data-tag-name") else { continue; };
-            let name = raw_name.trim();
-            if name.is_empty() { continue; }
-            let key = format!("{}\0{}", category, name.to_ascii_lowercase());
-            if seen_tags.insert(key) { tags.push((category.to_string(), name.to_string())); }
-        }
+    // Danbooru exposes both semantic list classes and numeric tag-type classes.
+    // Read the numeric class from each tag row first; it is stable even when the
+    // surrounding list markup changes.
+    let tag_selector = Selector::parse("#tag-list li[data-tag-name], section#tag-list li[data-tag-name]").unwrap();
+    for item in document.select(&tag_selector) {
+        let Some(raw_name) = item.value().attr("data-tag-name") else { continue; };
+        let name = raw_name.trim();
+        if name.is_empty() { continue; }
+        let classes: HashSet<_> = item.value().classes().collect();
+        let category = if classes.contains("tag-type-1") {
+            "artist"
+        } else if classes.contains("tag-type-3") {
+            "copyright"
+        } else if classes.contains("tag-type-4") {
+            "character"
+        } else if classes.contains("tag-type-5") {
+            "metadata"
+        } else {
+            "general"
+        };
+        let key = format!("{}\0{}", category, name.to_ascii_lowercase());
+        if seen_tags.insert(key) { tags.push((category.to_string(), name.to_string())); }
     }
 
     let media_selectors = [

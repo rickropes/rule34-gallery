@@ -58,7 +58,7 @@ export default function TopBar() {
   return <>
     <header className="topbar">
       <div className="searchWrap" ref={searchWrap}>
-        <div className="searchBox"><Search size={17}/><input value={search} onFocus={()=>setShowSuggestions(true)} onChange={e=>{setSearch(e.target.value);setShowSuggestions(true);}} placeholder='Search tags, e.g. board:Mod App 1 or -"board:Mod App 1"'/></div>
+        <div className="searchBox"><Search size={17}/><input value={search} onFocus={()=>setShowSuggestions(true)} onChange={e=>{setSearch(e.target.value);setShowSuggestions(true);}} placeholder='Search tags or sources, e.g. site:x.com'/></div>
         {showSuggestions&&suggestions.length>0&&<div className="searchSuggestions">
           {suggestions.map(value=><button key={value} type="button" onPointerDown={e=>e.preventDefault()} onClick={()=>chooseSuggestion(value)}>{value.includes(":")?<><b>{value.split(":",1)[0]}</b>:{value.slice(value.indexOf(":")+1)}</>:<><b>{value}</b><span>category</span></>}</button>)}
         </div>}

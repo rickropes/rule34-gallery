@@ -3,6 +3,14 @@ import { ArrowDown, ArrowLeft, ArrowUp } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { getMobileQueueSettings, setMobileQueueSettings } from "@/tauri/mobileQueueApi";
 import { listTagCategories } from "@/providers/tagProvider";
+import { cleanupInvalidTags } from "@/tauri/mediaApi";
+import { useAppStore } from "@/store/appStore";
+import {
+  loadResizeFilter,
+  saveResizeFilter,
+  RESIZE_FILTER_OPTIONS,
+  type ResizeFilter,
+} from "@/services/resizePreferences";
 import {
   loadCategoryPreferences,
   saveCategoryPreferences,
@@ -11,10 +19,12 @@ import {
 
 export default function SettingsPage() {
   const navigate = useNavigate();
+  const bumpLibraryVersion = useAppStore((state) => state.bumpLibraryVersion);
   const [endpoint, setEndpoint] = useState("");
   const [token, setToken] = useState("");
   const [message, setMessage] = useState("");
   const [categoryPreferences, setCategoryPreferences] = useState<CategoryPreference[]>([]);
+  const [resizeFilter, setResizeFilter] = useState<ResizeFilter>(() => loadResizeFilter());
 
   useEffect(() => {
     void getMobileQueueSettings()
@@ -61,6 +71,21 @@ export default function SettingsPage() {
     setMessage("Category appearance and priorities saved.");
   }
 
+  function saveResizeSettings() {
+    saveResizeFilter(resizeFilter);
+    setMessage(`Resize filter saved: ${RESIZE_FILTER_OPTIONS.find((option) => option.value === resizeFilter)?.label ?? resizeFilter}.`);
+  }
+
+  async function cleanInvalidTags() {
+    try {
+      const removed = await cleanupInvalidTags();
+      bumpLibraryVersion();
+      setMessage(`Removed ${removed} invalid symbol-only tag${removed === 1 ? "" : "s"}.`);
+    } catch (error) {
+      setMessage(String(error));
+    }
+  }
+
   return (
     <div className="settingsPage">
       <button className="settingsBackButton" onClick={() => navigate("/")}><ArrowLeft size={17} /> Back to gallery</button>
@@ -100,6 +125,29 @@ export default function SettingsPage() {
           ))}
         </div>
         <button className="primary" onClick={saveCategories}>Save category settings</button>
+      </section>
+
+
+      <section className="settingsCard">
+        <h2>Image resize filter</h2>
+        <p>Choose the resampling filter used by Half Size and Quarter Size. Nearest Neighbor is the default and fastest option.</p>
+        <label>
+          Resize filter
+          <select value={resizeFilter} onChange={(event) => setResizeFilter(event.target.value as ResizeFilter)}>
+            {RESIZE_FILTER_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </label>
+        <p>{RESIZE_FILTER_OPTIONS.find((option) => option.value === resizeFilter)?.description}</p>
+        <button className="primary" onClick={saveResizeSettings}>Save resize filter</button>
+      </section>
+
+
+      <section className="settingsCard">
+        <h2>Tag cleanup</h2>
+        <p>Remove existing tags whose names contain no letters or numbers, such as <code>general:^^^</code>, <code>general:!!</code>, and <code>general:&lt;=</code>.</p>
+        <button className="danger" onClick={() => void cleanInvalidTags()}>Remove invalid tags</button>
       </section>
 
       <section className="settingsCard">

@@ -4,6 +4,7 @@ mod state;
 mod commands;
 mod models;
 
+use commands::import_server::reimport_media;
 use commands::{
     library::get_media_count,
     media::list_media,
@@ -21,7 +22,9 @@ use commands::{
     media::process_media,
     media::media_ids_with_audio,
     media::trim_video,
-    media::list_collection_pages
+    media::list_collection_pages,
+    media::merge_media_images,
+    media::create_comic_from_images, media::add_images_to_comic, media::merge_comics_into_first, media::merge_comic_pages, media::delete_comic_page, media::cleanup_invalid_tags
 };
 
 #[tauri::command]
@@ -64,6 +67,101 @@ fn reveal_media_file(path: String) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[tauri::command]
+fn load_boards_json(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let path = dir.join("boards.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(path).map(Some).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_boards_json(app: tauri::AppHandle, json: String) -> Result<(), String> {
+    use tauri::Manager;
+    // Validate before replacing the shared file so a malformed frontend value cannot
+    // destroy the last usable board database.
+    let _: serde_json::Value = serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let path = dir.join("boards.json");
+    let temp = dir.join("boards.json.tmp");
+    std::fs::write(&temp, json).map_err(|error| error.to_string())?;
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::rename(temp, path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn extract_video_frame_png(path: String, time_seconds: f64) -> Result<Vec<u8>, String> {
+    use std::process::{Command, Stdio};
+
+    let input = std::path::PathBuf::from(&path);
+    if !input.is_file() {
+        return Err(format!("Video file does not exist: {}", input.display()));
+    }
+
+    let seek = if time_seconds.is_finite() && time_seconds > 0.0 {
+        time_seconds
+    } else {
+        0.0
+    };
+
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-ss")
+        .arg(format!("{seek:.6}"))
+        .arg("-i")
+        .arg(&input)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-f")
+        .arg("image2pipe")
+        .arg("-vcodec")
+        .arg("png")
+        .arg("pipe:1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "ffmpeg was not found. Install ffmpeg and make sure it is available in PATH.".to_string()
+            } else {
+                format!("Failed to start ffmpeg: {error}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            "ffmpeg could not extract a video frame.".to_string()
+        } else {
+            format!("ffmpeg could not extract a video frame: {details}")
+        });
+    }
+    if output.stdout.is_empty() {
+        return Err("ffmpeg returned an empty video frame.".to_string());
+    }
+    Ok(output.stdout)
+}
+
+#[tauri::command]
+fn save_pdf_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    let path = std::path::PathBuf::from(path);
+    if path.extension().and_then(|value| value.to_str()).map(|value| value.eq_ignore_ascii_case("pdf")) != Some(true) {
+        return Err("The export path must end in .pdf".to_string());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
 static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -172,6 +270,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             commands::import_server::start_import_server(app.handle().clone());
+            commands::mobile_queue::start_mobile_queue_worker(app.handle().clone());
 
             // Open the configured library in the backend so extension imports work
             // even while no gallery WebView exists.
@@ -211,6 +310,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ping,
             reveal_media_file,
+            load_boards_json,
+            save_boards_json,
+            extract_video_frame_png,
+            save_pdf_file,
             commands::settings::get_library_path,
             commands::settings::set_library_path,
             commands::library::initialize_library,
@@ -226,12 +329,20 @@ pub fn run() {
             list_tags_for_category,
             list_search_suggestions,
             import_media_url,
+            reimport_media,
             delete_media,
             add_tag_to_media,
             process_media,
             media_ids_with_audio,
             trim_video,
             list_collection_pages,
+            merge_media_images,
+            create_comic_from_images,
+            add_images_to_comic,
+            merge_comics_into_first,
+            merge_comic_pages,
+            delete_comic_page,
+            cleanup_invalid_tags,
             commands::import_server::list_import_queue,
             commands::mobile_queue::get_mobile_queue_settings,
             commands::mobile_queue::set_mobile_queue_settings,

@@ -2,19 +2,70 @@ import type { BoardRecord } from "@/types/board";
 import type { MediaRecord } from "@/types/media";
 
 const KEY = "rule34-library.boards.v1";
+
+let sharedStorageReady = false;
+let sharedWriteChain: Promise<void> = Promise.resolve();
+
+function normalizeBoards(value: unknown): BoardRecord[] {
+  if (!Array.isArray(value)) return [];
+  return (value as BoardRecord[]).map((board) => ({
+    ...board,
+    items: Array.isArray(board.items) ? board.items : [],
+    viewport: board.viewport && Number.isFinite(board.viewport.x) && Number.isFinite(board.viewport.y) && Number.isFinite(board.viewport.zoom)
+      ? board.viewport
+      : { x: 0, y: 0, zoom: 1 },
+  }));
+}
+
+async function invokeTauri<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(command, args);
+}
+
+function persistSharedBoards(json: string) {
+  if (!sharedStorageReady) return;
+  sharedWriteChain = sharedWriteChain
+    .catch(() => undefined)
+    .then(() => invokeTauri<void>("save_boards_json", { json }))
+    .catch((error) => console.error("Failed to save shared boards", error));
+}
+
+export async function initializeBoardStorage(): Promise<void> {
+  if (sharedStorageReady) return;
+  try {
+    const sharedJson = await invokeTauri<string | null>("load_boards_json");
+    if (sharedJson) {
+      const boards = normalizeBoards(JSON.parse(sharedJson));
+      localStorage.setItem(KEY, JSON.stringify(boards));
+    } else {
+      const localJson = localStorage.getItem(KEY);
+      if (localJson) {
+        const boards = normalizeBoards(JSON.parse(localJson));
+        await invokeTauri<void>("save_boards_json", { json: JSON.stringify(boards) });
+      }
+    }
+  } catch (error) {
+    // Browser-only development still works with localStorage.
+    console.warn("Shared board storage unavailable; using localStorage", error);
+  } finally {
+    sharedStorageReady = true;
+  }
+}
+
 export const BOARDS_CHANGED = "rule34-library.boards-changed";
 
 export function loadBoards(): BoardRecord[] {
   try {
-    const parsed = JSON.parse(localStorage.getItem(KEY) || "[]") as BoardRecord[];
-    return Array.isArray(parsed) ? parsed.map((board) => ({ ...board, items: Array.isArray(board.items) ? board.items : [], viewport: board.viewport && Number.isFinite(board.viewport.x) && Number.isFinite(board.viewport.y) && Number.isFinite(board.viewport.zoom) ? board.viewport : { x: 0, y: 0, zoom: 1 } })) : [];
+    return normalizeBoards(JSON.parse(localStorage.getItem(KEY) || "[]"));
   } catch {
     return [];
   }
 }
 
 export function saveBoards(boards: BoardRecord[]) {
-  localStorage.setItem(KEY, JSON.stringify(boards));
+  const json = JSON.stringify(normalizeBoards(boards));
+  localStorage.setItem(KEY, json);
+  persistSharedBoards(json);
   window.dispatchEvent(new Event(BOARDS_CHANGED));
 }
 

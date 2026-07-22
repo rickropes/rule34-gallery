@@ -1,5 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { MediaPage } from "@/types/media";
+import { loadResizeFilter } from "@/services/resizePreferences";
 export interface ImportMediaResult { importedCount:number; skippedCount:number; errors:string[] }
 export interface ProcessMediaResult { processedCount:number; errors:string[] }
 export async function ping(){return invoke<string>("ping")}
@@ -7,10 +8,21 @@ export async function listMedia(search="",addedFrom="",addedTo="",offset=0,limit
 export async function importMediaFiles(paths:string[]){return invoke<ImportMediaResult>("import_media_files",{paths})}
 export async function importMediaUrl(url:string,tags:string[]){return invoke<ImportMediaResult>("import_media_url",{url,tags})}
 export async function deleteMedia(mediaIds:number[]){return invoke<number>("delete_media",{mediaIds})}
-export async function processMedia(mediaIds:number[],operation:"half_size"|"quarter_size"|"remove_audio"){return invoke<ProcessMediaResult>("process_media",{mediaIds,operation})}
+export async function processMedia(mediaIds:number[],operation:"half_size"|"quarter_size"|"remove_audio"){return invoke<ProcessMediaResult>("process_media",{mediaIds,operation,resizeFilter:loadResizeFilter()})}
 export async function mediaIdsWithAudio(mediaIds:number[]){return invoke<number[]>("media_ids_with_audio",{mediaIds})}
 export async function trimVideo(mediaId:number,mode:"remove_start"|"remove_end",positionSeconds:number){return invoke<ProcessMediaResult>("trim_video",{mediaId,mode,positionSeconds})}
 export function getMediaAssetUrl(filePath:string){return convertFileSrc(filePath)}
 
 export async function listSearchSuggestions(query:string){return invoke<string[]>("list_search_suggestions",{query:query||null})}
 export async function listCollectionPages(collectionId:number){return invoke<import("@/types/media").MediaRecord[]>("list_collection_pages",{collectionId})}
+
+export async function mergeMediaImages(mediaIds:number[]){return invoke<ImportMediaResult>("merge_media_images",{mediaIds})}
+export interface ComicOperationResult { coverMediaId:number; affectedCount:number }
+export async function createComicFromImages(mediaIds:number[]){return invoke<ComicOperationResult>("create_comic_from_images",{mediaIds})}
+export async function addImagesToComic(collectionId:number,mediaIds:number[]){return invoke<ComicOperationResult>("add_images_to_comic",{collectionId,mediaIds})}
+export async function mergeComicsIntoFirst(collectionIds:number[]){return invoke<ComicOperationResult>("merge_comics_into_first",{collectionIds})}
+export async function mergeComicPages(collectionId:number){return invoke<ImportMediaResult>("merge_comic_pages",{collectionId})}
+
+export async function deleteComicPage(collectionId:number,mediaId:number){return invoke<ComicOperationResult>("delete_comic_page",{collectionId,mediaId})}
+
+export async function cleanupInvalidTags(){return invoke<number>("cleanup_invalid_tags")}

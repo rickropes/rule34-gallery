@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { ExternalLink, FolderOpen, ChevronLeft, ChevronRight, Maximize2, Minimize2, Scissors, Trash2, VolumeX, X } from "lucide-react";
+import { ExternalLink, FolderOpen, RefreshCw, ChevronLeft, ChevronRight, Maximize2, Minimize2, Scissors, Trash2, VolumeX, X } from "lucide-react";
 import { useAppStore } from "@/store/appStore";
 import { getMediaUrl } from "@/services/mediaService";
 import { listCollectionPages } from "@/tauri/mediaApi";
@@ -12,6 +12,7 @@ import {
 } from "@/providers/tagProvider";
 import {
   deleteMedia,
+  deleteComicPage,
   listMedia,
   processMedia,
   mediaIdsWithAudio,
@@ -50,6 +51,7 @@ export default function Inspector() {
   const bump = useAppStore((s) => s.bumpLibraryVersion);
   const setViewerOpen = useAppStore((s) => s.setViewerOpen);
   const setSearch = useAppStore((s) => s.setSearch);
+  const setSelectedMediaSelection = useAppStore((s) => s.setSelectedMediaSelection);
   const viewerOpen = useAppStore((s) => s.viewerOpen);
   const videoRef = useRef<HTMLVideoElement>(null);
   const inspectorRef = useRef<HTMLElement>(null);
@@ -72,9 +74,12 @@ export default function Inspector() {
   const [selectedItems, setSelectedItems] = useState<MediaRecord[]>([]);
   const [busy, setBusy] = useState(false);
   const [operationStatus, setOperationStatus] = useState<string | null>(null);
+  const [reimportOpen, setReimportOpen] = useState(false);
+  const [reimportMedia, setReimportMedia] = useState(true);
+  const [reimportMetadata, setReimportMetadata] = useState(true);
   const [audioVideoIds, setAudioVideoIds] = useState<number[]>([]);
   const [categoryPreferences, setCategoryPreferences] = useState<CategoryPreference[]>(() => loadCategoryPreferences());
-  const { tags, loading, error, addTag, removeTag } = useMediaTags(media?.id ?? null);
+  const { tags, loading, error, refresh: refreshTags, addTag, removeTag } = useMediaTags(media?.id ?? null);
   const isAnimatedGif = tags.some((tag) => tag.category.toLowerCase() === "metadata" && tag.name.toLowerCase() === "animated_gif");
 
   useEffect(() => {
@@ -209,6 +214,32 @@ export default function Inspector() {
   const multiple = selectedIds.length > 1;
   const selectedVideoIds = selectedItems.filter((item) => item.mediaType === "video").map((item) => item.id);
 
+  async function runReimport() {
+    if (!media || (!reimportMedia && !reimportMetadata)) return;
+    setBusy(true);
+    setOperationStatus("Reimporting…");
+    try {
+      const result = await invoke<{ mediaUpdated: boolean; metadataUpdated: boolean; tagCount: number }>("reimport_media", {
+        mediaId: media.id,
+        media: reimportMedia,
+        metadata: reimportMetadata,
+      });
+      const refreshedPage = await listMedia("", "", "", 0, 10000);
+      const refreshedMedia = refreshedPage.items.find((item) => item.id === media.id) ?? null;
+      if (!refreshedMedia) throw new Error("Reimport completed, but the refreshed media record could not be loaded.");
+      setSelectedMediaSelection(refreshedMedia, selectedIds);
+      if (result.metadataUpdated) await refreshTags();
+      bump();
+      window.dispatchEvent(new CustomEvent("rule34-library:media-reimported", { detail: { mediaId: media.id } }));
+      setReimportOpen(false);
+      setOperationStatus(`Reimport complete.${result.mediaUpdated ? " Media updated." : ""}${result.metadataUpdated ? ` ${result.tagCount} tags imported.` : ""}`);
+    } catch (error) {
+      setOperationStatus(String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (!name.trim() || !category.trim()) return;
@@ -230,6 +261,28 @@ export default function Inspector() {
       await deleteMedia(selectedIds);
       clear();
       bump();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeCurrentComicPage() {
+    if (!media?.collectionId || collectionPages.length <= 1) return;
+    const page = collectionPages[collectionIndex] ?? media;
+    if (!confirm(`Delete page ${collectionIndex + 1} of ${collectionPages.length} from this comic and disk?`)) return;
+    setBusy(true);
+    try {
+      const result = await deleteComicPage(media.collectionId, page.id);
+      const refreshed = await listMedia("", "", "", 0, 10000);
+      const cover = refreshed.items.find((item) => item.id === result.coverMediaId) ?? null;
+      const remainingPages = collectionPages.filter((item) => item.id !== page.id).map((item) => ({ ...item, collectionPageCount: collectionPages.length - 1 }));
+      setCollectionPages(remainingPages);
+      if (cover) setSelectedMediaSelection(cover, [cover.id]); else clear();
+      setCollectionIndex((index) => Math.max(0, Math.min(index, remainingPages.length - 1)));
+      bump();
+      window.dispatchEvent(new Event("rule34-library:force-gallery-refresh"));
+    } catch (cause) {
+      setOperationStatus(`Delete page failed: ${cause instanceof Error ? cause.message : String(cause)}`);
     } finally {
       setBusy(false);
     }
@@ -347,7 +400,10 @@ export default function Inspector() {
             <h2>{multiple ? `${selectedIds.length} items selected` : title}</h2>
             <p className="muted">{multiple ? "Bulk editing mode" : `${media.mediaType} · ${media.extension.toUpperCase()} · ${formatSize(media.filesize)}`}</p>
           </div>
-          <button className="danger" disabled={busy} onClick={() => void removeSelected()}><Trash2 size={16} /> Delete</button>
+          <div className="inspectorDeleteActions">
+            {!multiple && collectionPages.length > 1 && <button className="danger" disabled={busy} onClick={() => void removeCurrentComicPage()}><Trash2 size={16} /> Delete Page</button>}
+            <button className="danger" disabled={busy} onClick={() => void removeSelected()}><Trash2 size={16} /> Delete</button>
+          </div>
         </div>
 
         <section>
@@ -430,7 +486,17 @@ export default function Inspector() {
         {!multiple && (
           <section className="sourceLinkSection">
             {media.sourceUrl && (
-              <a className="sourceLink" href={media.sourceUrl} target="_blank" rel="noreferrer" title={media.sourceUrl}>
+              <a className="sourceLink" href={media.sourceUrl} target="_blank" rel="noreferrer" title={`${media.sourceUrl} · Middle-click to search this site`}
+                onAuxClick={(event) => {
+                  if (event.button !== 1) return;
+                  event.preventDefault();
+                  try {
+                    const host = new URL(media.sourceUrl!).hostname.replace(/^www\./i, "");
+                    const siteSearch = `site:${host}`;
+                    const current = useAppStore.getState().search.trim();
+                    setSearch(current ? `${current} ${siteSearch}` : siteSearch);
+                  } catch { /* Ignore malformed legacy source URLs. */ }
+                }}>
                 <ExternalLink size={15} /> Link
               </a>
             )}
@@ -441,6 +507,15 @@ export default function Inspector() {
               onClick={() => void invoke("reveal_media_file", { path: media.filePath })}
             >
               <FolderOpen size={15} /> Explorer
+            </button>
+            <button
+              className="sourceLink explorerLink"
+              type="button"
+              title="Reimport this item from its source link"
+              disabled={!media.sourceUrl || busy}
+              onClick={() => setReimportOpen(true)}
+            >
+              <RefreshCw size={15} /> Reimport
             </button>
           </section>
         )}
@@ -454,6 +529,22 @@ export default function Inspector() {
           </section>
         )}
       </div>
+
+      {reimportOpen && (
+        <div className="reimportModalBackdrop" role="presentation" onMouseDown={() => !busy && setReimportOpen(false)}>
+          <div className="reimportModal" role="dialog" aria-modal="true" aria-labelledby="reimport-title" onMouseDown={(event) => event.stopPropagation()}>
+            <h3 id="reimport-title">Reimport</h3>
+            <p>Choose what to replace using the original source link.</p>
+            <label><input type="checkbox" checked={reimportMedia} disabled={busy} onChange={(event) => setReimportMedia(event.target.checked)} /> Media</label>
+            <label><input type="checkbox" checked={reimportMetadata} disabled={busy} onChange={(event) => setReimportMetadata(event.target.checked)} /> Metadata</label>
+            <small>Metadata reimport removes the item’s current tags before importing the source tags again.</small>
+            <div className="reimportModalActions">
+              <button type="button" disabled={busy} onClick={() => setReimportOpen(false)}>Cancel</button>
+              <button type="button" className="primary" disabled={busy || (!reimportMedia && !reimportMetadata)} onClick={() => void runReimport()}>{busy ? "Reimporting…" : "Reimport"}</button>
+            </div>
+          </div>
+        </div>
+      )}
     </aside>
   );
 }

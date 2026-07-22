@@ -83,5 +83,15 @@ export function useMedia() {
     return () => window.clearTimeout(id);
   }, [loadFirstPage]);
 
+  useEffect(() => {
+    const forceRefresh = () => void loadFirstPage();
+    window.addEventListener("rule34-library:force-gallery-refresh", forceRefresh);
+    window.addEventListener("rule34-library:media-reimported", forceRefresh);
+    return () => {
+      window.removeEventListener("rule34-library:force-gallery-refresh", forceRefresh);
+      window.removeEventListener("rule34-library:media-reimported", forceRefresh);
+    };
+  }, [loadFirstPage]);
+
   return { media, total, loading, loadingMore, error, refresh: loadFirstPage, loadMore, hasMore: media.length < total };
 }

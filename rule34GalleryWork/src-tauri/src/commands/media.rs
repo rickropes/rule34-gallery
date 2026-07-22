@@ -35,6 +35,12 @@ fn classify_extension(ext: &str) -> Option<&'static str> {
     }
 }
 
+
+pub(crate) fn is_valid_tag_name(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && trimmed.chars().any(|ch| ch.is_alphanumeric())
+}
+
 fn media_directory(root: &Path, media_type: &str) -> PathBuf {
     root.join("media").join(if media_type == "video" { "videos" } else { "images" })
 }
@@ -170,6 +176,13 @@ fn media_matches(connection: &rusqlite::Connection, media: &MediaRecord, terms: 
             let Ok(minimum) = value.parse::<i64>() else { return false; };
             media.media_type == "image"
                 && media.width.unwrap_or(0).max(media.height.unwrap_or(0)) > minimum
+        } else if let Some(domain) = term.value.strip_prefix("site:") {
+            media.source_url.as_deref().and_then(|source| url::Url::parse(source).ok())
+                .and_then(|parsed| parsed.host_str().map(|host| host.trim_start_matches("www.").to_lowercase()))
+                .map(|host| {
+                    let wanted = domain.trim_start_matches("www.");
+                    host == wanted || host.ends_with(&format!(".{wanted}"))
+                }).unwrap_or(false)
         } else {
             let (cat, name) = term.value.split_once(':').unwrap_or(("", term.value.as_str()));
             tags.iter().any(|(tag_category, tag_name)| {
@@ -263,7 +276,7 @@ pub fn list_tags_for_category(category: String, state: tauri::State<'_, AppState
 pub fn add_media_tag(media_id: i64, tag_name: String, category: Option<String>, state: tauri::State<'_, AppState>) -> Result<TagRecord, String> {
     let name = tag_name.trim();
     let cat = category.as_deref().unwrap_or("").trim();
-    if name.is_empty() || cat.is_empty() { return Err("Category and tag name are required.".to_string()); }
+    if !is_valid_tag_name(name) || cat.is_empty() { return Err("Tag names must contain at least one letter or number.".to_string()); }
     let mut library = state.library_connection.lock().map_err(|_| "Failed to access the library database.".to_string())?;
     let connection = library.as_mut().ok_or_else(|| "No library is currently open.".to_string())?;
     let tx = connection.transaction().map_err(|e| e.to_string())?;
@@ -303,7 +316,7 @@ pub fn add_tag_to_media(media_ids: Vec<i64>, tag_name: String, category: Option<
     let name = tag_name.trim();
     let cat = category.as_deref().unwrap_or("").trim();
     if media_ids.is_empty() { return Err("Select at least one media item.".to_string()); }
-    if name.is_empty() || cat.is_empty() { return Err("Category and tag name are required.".to_string()); }
+    if !is_valid_tag_name(name) || cat.is_empty() { return Err("Tag names must contain at least one letter or number.".to_string()); }
     let mut library = state.library_connection.lock().map_err(|_| "Failed to access the library database.".to_string())?;
     let connection = library.as_mut().ok_or_else(|| "No library is currently open.".to_string())?;
     let tx = connection.transaction().map_err(|e| e.to_string())?;
@@ -312,6 +325,31 @@ pub fn add_tag_to_media(media_ids: Vec<i64>, tag_name: String, category: Option<
     for media_id in media_ids { tx.execute("INSERT OR IGNORE INTO media_tags(media_id,tag_id) VALUES(?1,?2)", params![media_id,id]).map_err(|e| e.to_string())?; }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(TagRecord{id,name:name.to_string(),category:cat.to_string()})
+}
+
+#[tauri::command]
+pub fn cleanup_invalid_tags(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let mut library = state.library_connection.lock().map_err(|_| "Failed to access the library database.".to_string())?;
+    let connection = library.as_mut().ok_or_else(|| "No library is currently open.".to_string())?;
+    let tx = connection.transaction().map_err(|e| e.to_string())?;
+    let invalid_ids = {
+        let mut stmt = tx.prepare("SELECT id,name FROM tags").map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows.into_iter()
+            .filter(|(_, name)| !is_valid_tag_name(name))
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>()
+    };
+    for id in &invalid_ids {
+        tx.execute("DELETE FROM media_tags WHERE tag_id=?1", [id]).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM tags WHERE id=?1", [id]).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(invalid_ids.len())
 }
 
 #[tauri::command]
@@ -375,14 +413,34 @@ pub struct ProcessMediaResult {
     errors: Vec<String>,
 }
 
-fn run_ffmpeg(input: &Path, output: &Path, operation: &str, extension: &str) -> Result<(), String> {
+fn ffmpeg_scale_filter(filter: &str) -> &'static str {
+    match filter {
+        "triangle" => "bilinear",
+        "catmull_rom" => "bicubic",
+        "gaussian" => "gauss",
+        "lanczos3" => "lanczos",
+        _ => "neighbor",
+    }
+}
+
+fn image_resize_filter(filter: &str) -> image::imageops::FilterType {
+    match filter {
+        "triangle" => image::imageops::FilterType::Triangle,
+        "catmull_rom" => image::imageops::FilterType::CatmullRom,
+        "gaussian" => image::imageops::FilterType::Gaussian,
+        "lanczos3" => image::imageops::FilterType::Lanczos3,
+        _ => image::imageops::FilterType::Nearest,
+    }
+}
+
+fn run_ffmpeg(input: &Path, output: &Path, operation: &str, extension: &str, resize_filter: &str) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
     command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error").arg("-i").arg(input);
 
     match operation {
         "half_size" | "quarter_size" => {
             let divisor = if operation == "quarter_size" { 8 } else { 4 };
-            command.arg("-vf").arg(format!("scale=ceil(iw/{divisor})*2:ceil(ih/{divisor})*2"));
+            command.arg("-vf").arg(format!("scale=ceil(iw/{divisor})*2:ceil(ih/{divisor})*2:flags={}", ffmpeg_scale_filter(resize_filter)));
             match extension {
                 "webm" => {
                     command.args(["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-c:a", "libopus"]);
@@ -415,11 +473,11 @@ fn run_ffmpeg(input: &Path, output: &Path, operation: &str, extension: &str) -> 
     Ok(())
 }
 
-fn resize_image(input: &Path, output: &Path, divisor: u32) -> Result<(i64, i64), String> {
+fn resize_image(input: &Path, output: &Path, divisor: u32, resize_filter: &str) -> Result<(i64, i64), String> {
     let image = image::open(input).map_err(|error| format!("Failed to decode image: {error}"))?;
     let width = (image.width() / divisor).max(1);
     let height = (image.height() / divisor).max(1);
-    image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+    image.resize_exact(width, height, image_resize_filter(resize_filter))
         .save(output)
         .map_err(|error| format!("Failed to save resized image: {error}"))?;
     Ok((i64::from(width), i64::from(height)))
@@ -467,12 +525,16 @@ pub fn media_ids_with_audio(media_ids: Vec<i64>, state: tauri::State<'_, AppStat
 }
 
 #[tauri::command]
-pub fn process_media(media_ids: Vec<i64>, operation: String, state: tauri::State<'_, AppState>) -> Result<ProcessMediaResult, String> {
+pub fn process_media(media_ids: Vec<i64>, operation: String, resize_filter: Option<String>, state: tauri::State<'_, AppState>) -> Result<ProcessMediaResult, String> {
     if media_ids.is_empty() {
         return Ok(ProcessMediaResult { processed_count: 0, errors: Vec::new() });
     }
     if operation != "half_size" && operation != "quarter_size" && operation != "remove_audio" {
         return Err(format!("Unsupported media operation: {operation}"));
+    }
+    let resize_filter = resize_filter.as_deref().unwrap_or("nearest");
+    if !matches!(resize_filter, "nearest" | "triangle" | "catmull_rom" | "gaussian" | "lanczos3") {
+        return Err(format!("Unsupported resize filter: {resize_filter}"));
     }
 
     let root = state.library_path.lock().map_err(|_| "Failed to access the library path.".to_string())?
@@ -533,9 +595,9 @@ pub fn process_media(media_ids: Vec<i64>, operation: String, state: tauri::State
 
         let dimensions = if (operation == "half_size" || operation == "quarter_size") && media_type == "image" && extension != "gif" {
             let divisor = if operation == "quarter_size" { 4 } else { 2 };
-            resize_image(&input, &temp, divisor).map(Some)
+            resize_image(&input, &temp, divisor, resize_filter).map(Some)
         } else {
-            run_ffmpeg(&input, &temp, &operation, &extension).map(|_| {
+            run_ffmpeg(&input, &temp, &operation, &extension, resize_filter).map(|_| {
                 if operation == "half_size" || operation == "quarter_size" {
                     let divisor = if operation == "quarter_size" { 4 } else { 2 };
                     old_width.zip(old_height).map(|(w, h)| ((w / divisor).max(1), (h / divisor).max(1)))
@@ -707,6 +769,77 @@ pub fn trim_video(media_id: i64, mode: String, position_seconds: f64, state: tau
     Ok(ProcessMediaResult { processed_count: 1, errors: Vec::new() })
 }
 
+
+#[tauri::command]
+pub fn merge_media_images(media_ids: Vec<i64>, state: tauri::State<'_, AppState>) -> Result<ImportMediaResult, String> {
+    if media_ids.len() < 2 { return Err("Select at least two images to merge.".into()); }
+    let root = state.library_path.lock().map_err(|_| "Failed to access the library path.".to_string())?.clone().ok_or_else(|| "No library is currently open.".to_string())?;
+    let mut library = state.library_connection.lock().map_err(|_| "Failed to access the library database.".to_string())?;
+    let connection = library.as_mut().ok_or_else(|| "No library is currently open.".to_string())?;
+
+    let mut decoded = Vec::with_capacity(media_ids.len());
+    let mut first_name = String::from("merged");
+    for (index, media_id) in media_ids.iter().enumerate() {
+        let (stored, media_type, original): (String, String, Option<String>) = connection.query_row(
+            "SELECT stored_filename,media_type,original_filename FROM media WHERE id=?1", [media_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        ).map_err(|_| format!("Media item {media_id} was not found."))?;
+        if media_type != "image" { return Err("Only still images can be merged.".into()); }
+        if index == 0 { first_name = original.unwrap_or(stored.clone()); }
+        let path = media_directory(&root, "image").join(stored);
+        decoded.push(image::open(&path).map_err(|e| format!("Failed to decode {}: {e}", path.display()))?);
+    }
+
+    let count = decoded.len();
+    let landscape_count = decoded.iter().filter(|image| image.width() > image.height()).count();
+    let portrait_count = decoded.iter().filter(|image| image.height() > image.width()).count();
+
+    // Arrange the images opposite to their dominant orientation so the merged
+    // result stays compact: mostly landscape images stack vertically, while
+    // mostly portrait images sit horizontally. Mixed-orientation ties stack
+    // vertically, as do collections made entirely from square images.
+    let columns = if portrait_count > landscape_count { count } else { 1 };
+    let rows = (count + columns - 1) / columns;
+    let mut widths = vec![0u32; columns];
+    let mut heights = vec![0u32; rows];
+    for (i, image) in decoded.iter().enumerate() {
+        widths[i % columns] = widths[i % columns].max(image.width());
+        heights[i / columns] = heights[i / columns].max(image.height());
+    }
+    let canvas_w: u32 = widths.iter().try_fold(0u32, |a,&b| a.checked_add(b).ok_or(())).map_err(|_| "Merged image is too wide.")?;
+    let canvas_h: u32 = heights.iter().try_fold(0u32, |a,&b| a.checked_add(b).ok_or(())).map_err(|_| "Merged image is too tall.")?;
+    let mut x_offsets=vec![0u32;widths.len()]; for i in 1..widths.len(){x_offsets[i]=x_offsets[i-1]+widths[i-1];}
+    let mut y_offsets=vec![0u32;heights.len()]; for i in 1..heights.len(){y_offsets[i]=y_offsets[i-1]+heights[i-1];}
+    let mut canvas=image::RgbaImage::new(canvas_w,canvas_h);
+    for (i,img) in decoded.into_iter().enumerate(){
+        let rgba=img.to_rgba8(); let c=i%columns; let r=i/columns;
+        let x=x_offsets[c]+(widths[c]-rgba.width())/2; let y=y_offsets[r]+(heights[r]-rgba.height())/2;
+        image::imageops::overlay(&mut canvas,&rgba,x.into(),y.into());
+    }
+    // Preserve the full composed resolution; merged images are no longer
+    // automatically reduced to half size.
+    let output = canvas;
+    let unique=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let temp=std::env::temp_dir().join(format!("gallery-merged-{unique}.png"));
+    image::DynamicImage::ImageRgba8(output).save(&temp).map_err(|e|format!("Failed to save merged image: {e}"))?;
+    let (new_id, imported)=import_one_with_id(&temp,&root,connection)?;
+    let _=fs::remove_file(&temp);
+    if !imported { return Ok(ImportMediaResult{imported_count:0,skipped_count:1,errors:vec![]}); }
+
+    let first_id=media_ids[0];
+    let stem=Path::new(&first_name).file_stem().and_then(|v|v.to_str()).unwrap_or("merged");
+    connection.execute("UPDATE media SET original_filename=?1, favorite=(SELECT favorite FROM media WHERE id=?2) WHERE id=?3", params![format!("{stem}-merged.png"),first_id,new_id]).map_err(|e|e.to_string())?;
+    connection.execute("INSERT OR IGNORE INTO media_tags(media_id,tag_id) SELECT ?1,tag_id FROM media_tags WHERE media_id=?2",params![new_id,first_id]).map_err(|e|e.to_string())?;
+    // A flattened result is a normal image, even when its source was a comic page.
+    connection.execute(
+        "DELETE FROM media_tags WHERE media_id=?1 AND tag_id IN (SELECT id FROM tags WHERE lower(category)='metadata' AND lower(name)='comic_hentai')",
+        [new_id],
+    ).map_err(|e|e.to_string())?;
+    connection.execute("DELETE FROM tags WHERE lower(category)='metadata' AND lower(name)='comic_hentai' AND NOT EXISTS (SELECT 1 FROM media_tags WHERE media_tags.tag_id=tags.id)",[]).map_err(|e|e.to_string())?;
+    connection.execute("INSERT OR IGNORE INTO sources(media_id,site,post_id,url,imported_at) SELECT ?1,site,post_id,url,datetime('now') FROM sources WHERE media_id=?2",params![new_id,first_id]).map_err(|e|e.to_string())?;
+    Ok(ImportMediaResult{imported_count:1,skipped_count:0,errors:vec![]})
+}
+
 #[tauri::command]
 pub fn import_media_files(paths: Vec<String>, state: tauri::State<'_, AppState>) -> Result<ImportMediaResult, String> {
     let root = state.library_path.lock().map_err(|_| "Failed to access the library path.".to_string())?.clone().ok_or_else(|| "No library is currently open.".to_string())?;
@@ -744,7 +877,7 @@ pub fn import_media_url(url: String, tags: Vec<String>, state: tauri::State<'_, 
 }
 
 fn add_tag_direct(connection:&rusqlite::Connection, media_id:i64, category:&str, name:&str)->Result<(),String>{
-    let c=category.trim(); let n=name.trim(); if c.is_empty()||n.is_empty(){return Ok(())}
+    let c=category.trim(); let n=name.trim(); if c.is_empty()||!is_valid_tag_name(n){return Ok(())}
     connection.execute("INSERT INTO tags(name,category) VALUES(?1,?2) ON CONFLICT(name,category) DO NOTHING",params![n,c]).map_err(|e|e.to_string())?;
     let id:i64=connection.query_row("SELECT id FROM tags WHERE name=?1 COLLATE NOCASE AND category=?2 COLLATE NOCASE",params![n,c],|r|r.get(0)).map_err(|e|e.to_string())?;
     connection.execute("INSERT OR IGNORE INTO media_tags(media_id,tag_id) VALUES(?1,?2)",params![media_id,id]).map_err(|e|e.to_string())?; Ok(())
@@ -956,3 +1089,134 @@ pub(crate) fn import_downloaded_media(source: &Path, root: &Path, connection: &r
 
 #[tauri::command]
 pub fn insert_test_media(_state: tauri::State<'_, AppState>) -> Result<i64,String>{Err("Test media insertion is disabled.".to_string())}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComicOperationResult { pub cover_media_id: i64, pub affected_count: usize }
+
+fn clone_image_media(connection: &rusqlite::Connection, root: &Path, source_id: i64, nonce: u128) -> Result<i64,String> {
+    let (stored, media_type, original): (String,String,Option<String>) = connection.query_row(
+        "SELECT stored_filename,media_type,original_filename FROM media WHERE id=?1", [source_id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))
+    ).map_err(|_|format!("Media item {source_id} was not found."))?;
+    if media_type!="image" { return Err("Comic pages must be images.".into()); }
+    let path=media_directory(root,"image").join(stored);
+    let mut rgba=image::open(&path).map_err(|e|format!("Failed to decode {}: {e}",path.display()))?.to_rgba8();
+    if rgba.width()>0 && rgba.height()>0 { let pixel=rgba.get_pixel_mut(0,0); pixel.0[3]=pixel.0[3].saturating_sub(((nonce%2)+1) as u8); }
+    let temp=std::env::temp_dir().join(format!("gallery-comic-page-{nonce}.png"));
+    image::DynamicImage::ImageRgba8(rgba).save(&temp).map_err(|e|format!("Failed to prepare comic page: {e}"))?;
+    let (new_id, imported)=import_one_with_id(&temp,root,connection)?; let _=fs::remove_file(&temp);
+    if !imported { return Err("Could not create a distinct comic page copy.".into()); }
+    connection.execute("UPDATE media SET original_filename=?1,favorite=(SELECT favorite FROM media WHERE id=?2) WHERE id=?3",params![original,source_id,new_id]).map_err(|e|e.to_string())?;
+    connection.execute("INSERT OR IGNORE INTO media_tags(media_id,tag_id) SELECT ?1,tag_id FROM media_tags WHERE media_id=?2",params![new_id,source_id]).map_err(|e|e.to_string())?;
+    connection.execute("INSERT OR IGNORE INTO sources(media_id,site,post_id,url,imported_at) SELECT ?1,site,post_id,url,datetime('now') FROM sources WHERE media_id=?2",params![new_id,source_id]).map_err(|e|e.to_string())?;
+    Ok(new_id)
+}
+
+fn append_cloned_pages(connection:&mut rusqlite::Connection,root:&Path,collection_id:i64,source_ids:&[i64])->Result<Vec<i64>,String>{
+    let start:i64=connection.query_row("SELECT COALESCE(MAX(position),0) FROM collection_pages WHERE collection_id=?1",[collection_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+    let mut created=Vec::new();
+    for (index,source_id) in source_ids.iter().enumerate(){
+        let nonce=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()+index as u128;
+        let id=clone_image_media(connection,root,*source_id,nonce)?;
+        let pos=start+index as i64+1;
+        connection.execute("INSERT INTO collection_pages(collection_id,media_id,page_number,position) VALUES(?1,?2,?3,?3)",params![collection_id,id,pos]).map_err(|e|e.to_string())?;
+        created.push(id);
+    }
+    Ok(created)
+}
+
+#[tauri::command]
+pub fn create_comic_from_images(media_ids:Vec<i64>,state:tauri::State<'_,AppState>)->Result<ComicOperationResult,String>{
+    if media_ids.len()<2{return Err("Select at least two images.".into())}
+    let root=state.library_path.lock().map_err(|_|"Failed to access the library path.".to_string())?.clone().ok_or_else(||"No library is currently open.".to_string())?;
+    let mut library=state.library_connection.lock().map_err(|_|"Failed to access the library database.".to_string())?;
+    let connection=library.as_mut().ok_or_else(||"No library is currently open.".to_string())?;
+    let first_name:Option<String>=connection.query_row("SELECT original_filename FROM media WHERE id=?1",[media_ids[0]],|r|r.get(0)).optional().map_err(|e|e.to_string())?.flatten();
+    let unique=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().to_string();
+    connection.execute("INSERT INTO collections(collection_type,title,source_url,source_external_id,cover_media_id,created_at) VALUES('local_comic',?1,'',?2,NULL,datetime('now'))",params![first_name.unwrap_or_else(||"Untitled comic".into()),format!("local-{unique}")]).map_err(|e|e.to_string())?;
+    let collection_id=connection.last_insert_rowid();
+    let pages=append_cloned_pages(connection,&root,collection_id,&media_ids)?;
+    let cover=pages[0];
+    connection.execute("UPDATE collections SET cover_media_id=?1 WHERE id=?2",params![cover,collection_id]).map_err(|e|e.to_string())?;
+    add_tag_direct(connection,cover,"metadata","comic_hentai")?;
+    Ok(ComicOperationResult{cover_media_id:cover,affected_count:pages.len()})
+}
+
+#[tauri::command]
+pub fn add_images_to_comic(collection_id:i64,media_ids:Vec<i64>,state:tauri::State<'_,AppState>)->Result<ComicOperationResult,String>{
+    if media_ids.is_empty(){return Err("Select at least one image to add.".into())}
+    let root=state.library_path.lock().map_err(|_|"Failed to access the library path.".to_string())?.clone().ok_or_else(||"No library is currently open.".to_string())?;
+    let mut library=state.library_connection.lock().map_err(|_|"Failed to access the library database.".to_string())?;
+    let connection=library.as_mut().ok_or_else(||"No library is currently open.".to_string())?;
+    let cover:i64=connection.query_row("SELECT cover_media_id FROM collections WHERE id=?1",[collection_id],|r|r.get(0)).map_err(|_|"Comic was not found.".to_string())?;
+    let pages=append_cloned_pages(connection,&root,collection_id,&media_ids)?;
+    add_tag_direct(connection,cover,"metadata","comic_hentai")?;
+    Ok(ComicOperationResult{cover_media_id:cover,affected_count:pages.len()})
+}
+
+#[tauri::command]
+pub fn merge_comics_into_first(collection_ids:Vec<i64>,state:tauri::State<'_,AppState>)->Result<ComicOperationResult,String>{
+    if collection_ids.len()<2{return Err("Select at least two comics.".into())}
+    let root=state.library_path.lock().map_err(|_|"Failed to access the library path.".to_string())?.clone().ok_or_else(||"No library is currently open.".to_string())?;
+    let mut library=state.library_connection.lock().map_err(|_|"Failed to access the library database.".to_string())?;
+    let connection=library.as_mut().ok_or_else(||"No library is currently open.".to_string())?;
+    let target=collection_ids[0];
+    let cover:i64=connection.query_row("SELECT cover_media_id FROM collections WHERE id=?1",[target],|r|r.get(0)).map_err(|_|"First comic was not found.".to_string())?;
+    let mut source_pages=Vec::new();
+    for collection_id in collection_ids.iter().skip(1){
+        let mut stmt=connection.prepare("SELECT media_id FROM collection_pages WHERE collection_id=?1 ORDER BY position").map_err(|e|e.to_string())?;
+        let ids=stmt.query_map([collection_id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+        source_pages.extend(ids);
+    }
+    let pages=append_cloned_pages(connection,&root,target,&source_pages)?;
+    add_tag_direct(connection,cover,"metadata","comic_hentai")?;
+    Ok(ComicOperationResult{cover_media_id:cover,affected_count:pages.len()})
+}
+
+#[tauri::command]
+pub fn delete_comic_page(collection_id:i64,media_id:i64,state:tauri::State<'_,AppState>)->Result<ComicOperationResult,String>{
+    let root=state.library_path.lock().map_err(|_|"Failed to access the library path.".to_string())?.clone().ok_or_else(||"No library is currently open.".to_string())?;
+    let mut library=state.library_connection.lock().map_err(|_|"Failed to access the library database.".to_string())?;
+    let connection=library.as_mut().ok_or_else(||"No library is currently open.".to_string())?;
+    let tx=connection.transaction().map_err(|e|e.to_string())?;
+    let page_count:i64=tx.query_row("SELECT COUNT(*) FROM collection_pages WHERE collection_id=?1",[collection_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if page_count<=1{return Err("A comic must keep at least one page. Delete the comic instead.".into())}
+    let membership:Option<i64>=tx.query_row("SELECT position FROM collection_pages WHERE collection_id=?1 AND media_id=?2",params![collection_id,media_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    if membership.is_none(){return Err("The viewed media is not a page of this comic.".into())}
+    let file:Option<(String,String)>=tx.query_row("SELECT stored_filename,media_type FROM media WHERE id=?1",[media_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM collection_pages WHERE collection_id=?1 AND media_id=?2",params![collection_id,media_id]).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM media WHERE id=?1",[media_id]).map_err(|e|e.to_string())?;
+    let remaining:Vec<i64>={
+        let mut stmt=tx.prepare("SELECT media_id FROM collection_pages WHERE collection_id=?1 ORDER BY position,page_number").map_err(|e|e.to_string())?;
+        let rows=stmt.query_map([collection_id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?;
+        let collected=rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+        collected
+    };
+    for (index,id) in remaining.iter().enumerate(){
+        let position=index as i64+1;
+        tx.execute("UPDATE collection_pages SET page_number=?1,position=?1 WHERE collection_id=?2 AND media_id=?3",params![position,collection_id,id]).map_err(|e|e.to_string())?;
+    }
+    let cover=remaining[0];
+    tx.execute("UPDATE collections SET cover_media_id=?1 WHERE id=?2",params![cover,collection_id]).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM tags WHERE NOT EXISTS (SELECT 1 FROM media_tags WHERE media_tags.tag_id=tags.id)",[]).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())?;
+    if let Some((stored,kind))=file{
+        let path=media_directory(&root,&kind).join(stored);
+        if let Err(error)=fs::remove_file(&path){if error.kind()!=std::io::ErrorKind::NotFound{return Err(format!("Page was removed from the comic, but failed to delete {}: {error}",path.display()))}}
+    }
+    Ok(ComicOperationResult{cover_media_id:cover,affected_count:1})
+}
+
+#[tauri::command]
+pub fn merge_comic_pages(collection_id:i64,state:tauri::State<'_,AppState>)->Result<ImportMediaResult,String>{
+    let ids={
+        let library=state.library_connection.lock().map_err(|_|"Failed to access the library database.".to_string())?;
+        let connection=library.as_ref().ok_or_else(||"No library is currently open.".to_string())?;
+        let mut stmt=connection.prepare("SELECT media_id FROM collection_pages WHERE collection_id=?1 ORDER BY position").map_err(|e|e.to_string())?;
+        let rows=stmt.query_map([collection_id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?;
+        let collected=rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+        collected
+    };
+    merge_media_images(ids,state)
+}

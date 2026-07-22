@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Bold, BookOpen, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Italic, Move, Play, Save, Trash2, Type, Underline } from "lucide-react";
+import { ArrowLeft, Bold, BookOpen, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, FileDown, Italic, Move, Play, Save, Trash2, Type, Underline } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { loadBoards, updateBoard } from "@/services/boardService";
 import { useAppStore } from "@/store/appStore";
@@ -7,6 +7,10 @@ import { getMediaUrl } from "@/services/mediaService";
 import { listCollectionPages, listMedia } from "@/tauri/mediaApi";
 import type { MediaRecord } from "@/types/media";
 import type { BoardItem, BoardRecord } from "@/types/board";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
+import { message, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 
 type ViewState = { x: number; y: number; zoom: number };
 type PanState = { pointerId: number; startX: number; startY: number; viewX: number; viewY: number; moved: boolean };
@@ -44,7 +48,9 @@ export default function BoardCanvasPage() {
   const { id } = useParams();
   const nav = useNavigate();
   const gallery = useAppStore((state) => state.galleryMedia);
+  const libraryVersion = useAppStore((state) => state.libraryVersion);
   const setSelectedMedia = useAppStore((state) => state.setSelectedMedia);
+  const setSelectedMediaSelection = useAppStore((state) => state.setSelectedMediaSelection);
   const initial = useMemo(() => loadBoards().find((candidate) => candidate.id === id) ?? null, [id]);
 
   const [board, setBoard] = useState<BoardRecord | null>(initial);
@@ -56,6 +62,7 @@ export default function BoardCanvasPage() {
   const [insertMenu, setInsertMenu] = useState<InsertMenu | null>(null);
   const [fontSizeDrafts, setFontSizeDrafts] = useState<Record<string, number>>({});
   const [textRevision, setTextRevision] = useState(0);
+  const [exportingPdf, setExportingPdf] = useState(false);
   const pan = useRef<PanState | null>(null);
   const drag = useRef<DragState | null>(null);
   const itemElements = useRef(new Map<string, HTMLDivElement>());
@@ -73,7 +80,7 @@ export default function BoardCanvasPage() {
     void listMedia("", "", "", 0, 10000)
       .then((page) => setBoardMedia(page.items))
       .catch(() => setBoardMedia(gallery));
-  }, [gallery]);
+  }, [gallery, libraryVersion]);
 
   useEffect(() => {
     if (!board) return;
@@ -101,6 +108,22 @@ export default function BoardCanvasPage() {
         .finally(() => loadingCollections.current.delete(collectionId));
     });
   }, [board, boardMedia, collectionPages]);
+
+  useEffect(() => {
+    if (!board || selectedIds.size === 0) {
+      setSelectedMediaSelection(null, []);
+      return;
+    }
+    const selectedMediaItems = board.items
+      .filter((item) => selectedIds.has(item.id) && item.kind === "media" && item.mediaId)
+      .map((item) => boardMedia.find((candidate) => candidate.id === item.mediaId))
+      .filter((item): item is MediaRecord => Boolean(item));
+    if (selectedMediaItems.length === 0) {
+      setSelectedMediaSelection(null, []);
+      return;
+    }
+    setSelectedMediaSelection(selectedMediaItems[0], [...new Set(selectedMediaItems.map((item) => item.id))]);
+  }, [board, boardMedia, selectedIds, setSelectedMediaSelection]);
 
   useEffect(() => { boardRef.current = board; }, [board]);
   useEffect(() => { viewRef.current = view; }, [view]);
@@ -255,6 +278,376 @@ export default function BoardCanvasPage() {
     savedTextRevision.current = textRevision;
   }
 
+  function rotatedBounds(item: BoardItem, width: number, height: number) {
+    if (item.kind !== "media" || !item.rotation) {
+      return { left: item.x, top: item.y, right: item.x + width, bottom: item.y + height };
+    }
+    const radians = item.rotation * Math.PI / 180;
+    const rotatedWidth = Math.abs(width * Math.cos(radians)) + Math.abs(height * Math.sin(radians));
+    const rotatedHeight = Math.abs(width * Math.sin(radians)) + Math.abs(height * Math.cos(radians));
+    const centerX = item.x + width / 2;
+    const centerY = item.y + height / 2;
+    return {
+      left: centerX - rotatedWidth / 2,
+      top: centerY - rotatedHeight / 2,
+      right: centerX + rotatedWidth / 2,
+      bottom: centerY + rotatedHeight / 2,
+    };
+  }
+
+  async function exportToPdf() {
+    if (exportingPdf) return;
+    const currentBoard = board;
+    if (!currentBoard) return;
+    if (currentBoard.items.length === 0) {
+      await message("Add something to the board before exporting it.", { title: "Export to PDF", kind: "info" });
+      return;
+    }
+
+    let releaseInputLock: (() => void) | null = null;
+    let restoreVideoFrames: (() => void) | null = null;
+    setExportingPdf(true);
+
+    try {
+      // Commit the latest contentEditable HTML before freezing the board DOM.
+      const persisted = buildPersistedBoard();
+      setBoard(persisted);
+      boardRef.current = persisted;
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+
+      const lockUserInput = () => {
+        const blockedEvents = [
+          "pointerdown", "pointermove", "pointerup", "pointercancel",
+          "mousedown", "mousemove", "mouseup", "click", "dblclick", "contextmenu",
+          "touchstart", "touchmove", "touchend", "touchcancel",
+          "wheel", "keydown", "keyup", "keypress", "beforeinput", "input", "change",
+          "dragstart", "drag", "dragend", "drop",
+        ];
+        const block = (event: Event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+        };
+        blockedEvents.forEach((eventName) => window.addEventListener(eventName, block, { capture: true, passive: false }));
+
+        const overlay = document.createElement("div");
+        overlay.className = "boardPdfInputLock";
+        overlay.setAttribute("role", "status");
+        overlay.setAttribute("aria-live", "polite");
+        overlay.textContent = "Preparing PDF…";
+        Object.assign(overlay.style, {
+          position: "fixed",
+          inset: "0",
+          zIndex: "2147483647",
+          cursor: "wait",
+          background: "rgba(10, 12, 16, 0.18)",
+          display: "grid",
+          placeItems: "center",
+          color: "white",
+          fontSize: "16px",
+          fontWeight: "600",
+          pointerEvents: "auto",
+          userSelect: "none",
+        });
+        document.body.appendChild(overlay);
+        const activeElement = document.activeElement;
+        if (activeElement instanceof HTMLElement) activeElement.blur();
+
+        return () => {
+          blockedEvents.forEach((eventName) => window.removeEventListener(eventName, block, { capture: true }));
+          overlay.remove();
+        };
+      };
+
+      const captureVideoFrame = async (video: HTMLVideoElement, fallbackWidth: number, fallbackHeight: number) => {
+        const drawFrame = (source: HTMLVideoElement) => {
+          if (source.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return null;
+          const frame = document.createElement("canvas");
+          frame.width = Math.max(1, source.videoWidth || Math.round(fallbackWidth));
+          frame.height = Math.max(1, source.videoHeight || Math.round(fallbackHeight));
+          const context = frame.getContext("2d");
+          if (!context) return null;
+          context.drawImage(source, 0, 0, frame.width, frame.height);
+          return frame.toDataURL("image/png");
+        };
+
+        try {
+          const currentFrame = drawFrame(video);
+          if (currentFrame) return currentFrame;
+        } catch {
+          // Try a detached decoder below.
+        }
+
+        // Tauri's asset protocol can display a video while still preventing a
+        // WebView canvas from reading its pixels. Ask the native side to decode
+        // the frame directly from the local file before trying another WebView
+        // video element.
+        const filePath = video.dataset.filePath;
+        if (filePath) {
+          try {
+            const bytes = await invoke<number[]>("extract_video_frame_png", {
+              path: filePath,
+              timeSeconds: Number.isFinite(video.currentTime) ? video.currentTime : 0,
+            });
+            if (bytes.length > 0) {
+              const binary = new Uint8Array(bytes);
+              const blob = new Blob([binary], { type: "image/png" });
+              return await new Promise<string>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result));
+                reader.onerror = () => reject(reader.error);
+                reader.readAsDataURL(blob);
+              });
+            }
+          } catch (error) {
+            console.warn("Native video frame extraction failed; trying WebView decoder", error);
+          }
+        }
+
+        const decoder = document.createElement("video");
+        decoder.muted = true;
+        decoder.preload = "auto";
+        decoder.playsInline = true;
+        decoder.crossOrigin = video.crossOrigin;
+        decoder.src = video.currentSrc || video.src;
+        const waitFor = (eventName: "loadeddata" | "seeked", timeout = 5000) => new Promise<void>((resolve) => {
+          const timer = window.setTimeout(resolve, timeout);
+          decoder.addEventListener(eventName, () => {
+            window.clearTimeout(timer);
+            resolve();
+          }, { once: true });
+        });
+
+        try {
+          decoder.load();
+          await waitFor("loadeddata");
+          const requestedTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+          if (decoder.duration > 0 && requestedTime > 0) {
+            decoder.currentTime = Math.min(requestedTime, Math.max(0, decoder.duration - 0.001));
+            await waitFor("seeked");
+          }
+          return drawFrame(decoder);
+        } catch {
+          return null;
+        } finally {
+          decoder.removeAttribute("src");
+          decoder.load();
+        }
+      };
+
+      releaseInputLock = lockUserInput();
+
+      // Replace the live video nodes in place. Cloning a board containing normal
+      // images is much more reliable than asking html2canvas to render <video>.
+      // Input stays locked until every original video has been restored.
+      const replacements: Array<{ image: HTMLImageElement; video: HTMLVideoElement }> = [];
+      const capturedVideoFrames = new Map<string, string>();
+      const liveVideos = Array.from(document.querySelectorAll<HTMLVideoElement>(".boardViewport .boardItem video"));
+      for (const video of liveVideos) {
+        const rect = video.getBoundingClientRect();
+        const frameUrl = await captureVideoFrame(video, rect.width, rect.height);
+        if (!frameUrl || !video.parentNode) continue;
+        const itemId = video.closest<HTMLElement>(".boardItem")?.dataset.boardItemId;
+        if (itemId) capturedVideoFrames.set(itemId, frameUrl);
+
+        const image = document.createElement("img");
+        image.src = frameUrl;
+        image.className = video.className;
+        image.style.cssText = video.style.cssText;
+        image.alt = "Video frame";
+        image.draggable = false;
+
+        const computed = getComputedStyle(video);
+        image.style.width = computed.width;
+        image.style.height = computed.height;
+        image.style.display = computed.display;
+        image.style.objectFit = computed.objectFit;
+        image.style.objectPosition = computed.objectPosition;
+        image.style.borderRadius = computed.borderRadius;
+        image.style.clipPath = computed.clipPath;
+        image.style.opacity = computed.opacity;
+        image.style.filter = computed.filter;
+        image.style.transform = computed.transform;
+        image.style.transformOrigin = computed.transformOrigin;
+
+        video.replaceWith(image);
+        replacements.push({ image, video });
+      }
+
+      restoreVideoFrames = () => {
+        for (const { image, video } of replacements.reverse()) {
+          if (image.parentNode) image.replaceWith(video);
+        }
+      };
+
+      await Promise.all(replacements.map(({ image }) => image.complete
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            image.addEventListener("load", () => resolve(), { once: true });
+            image.addEventListener("error", () => resolve(), { once: true });
+          })));
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+
+      const itemSizes = persisted.items.map((item) => {
+        const element = itemElements.current.get(item.id);
+        const storedMedia = item.mediaId ? boardMedia.find((candidate) => candidate.id === item.mediaId) : undefined;
+        const collectionId = item.collectionId ?? storedMedia?.collectionId ?? null;
+        const pages = collectionId ? (collectionPages[collectionId] ?? []) : [];
+        const pageIndex = item.pageIndex != null
+          ? Math.max(0, Math.min(Math.max(0, pages.length - 1), item.pageIndex))
+          : Math.max(0, pages.findIndex((page) => page.id === item.mediaId));
+        const media = pages[pageIndex] ?? storedMedia;
+        const ratio = mediaAspectRatio(media, item);
+        const width = item.kind === "media" ? item.width : Math.max(1, element?.offsetWidth ?? item.width ?? 1);
+        const height = item.kind === "media" ? item.width / ratio : Math.max(1, element?.offsetHeight ?? item.height ?? 1);
+        return { item, width, height, bounds: rotatedBounds(item, width, height) };
+      });
+
+      const padding = 28;
+      const minX = Math.min(...itemSizes.map(({ bounds }) => bounds.left));
+      const minY = Math.min(...itemSizes.map(({ bounds }) => bounds.top));
+      const maxX = Math.max(...itemSizes.map(({ bounds }) => bounds.right));
+      const maxY = Math.max(...itemSizes.map(({ bounds }) => bounds.bottom));
+      const exportWidth = Math.max(1, Math.ceil(maxX - minX + padding * 2));
+      const exportHeight = Math.max(1, Math.ceil(maxY - minY + padding * 2));
+
+      const exportRoot = document.createElement("div");
+      exportRoot.className = "boardPdfExportRoot";
+      Object.assign(exportRoot.style, {
+        position: "fixed",
+        left: "-100000px",
+        top: "0",
+        width: `${exportWidth}px`,
+        height: `${exportHeight}px`,
+        overflow: "hidden",
+        background: "#15181e",
+        zIndex: "-1",
+      });
+
+      for (const { item, width, height } of itemSizes) {
+        const original = itemElements.current.get(item.id);
+        if (!original) continue;
+        const clone = original.cloneNode(true) as HTMLDivElement;
+        clone.classList.remove("selected");
+        clone.querySelectorAll(".selected").forEach((node) => node.classList.remove("selected"));
+        clone.querySelectorAll(".boardTextToolbar,.boardTextDragHandle,.boardMediaControls,.boardResize,.boardMediaTypeBadge")
+          .forEach((node) => node.remove());
+        clone.querySelectorAll("[contenteditable]").forEach((node) => node.removeAttribute("contenteditable"));
+        Object.assign(clone.style, {
+          left: `${item.x - minX + padding}px`,
+          top: `${item.y - minY + padding}px`,
+          width: item.kind === "media" ? `${width}px` : clone.style.width,
+          height: item.kind === "media" ? `${height}px` : clone.style.height,
+          outline: "none",
+          boxShadow: "none",
+        });
+        exportRoot.appendChild(clone);
+      }
+
+      document.body.appendChild(exportRoot);
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      await Promise.all(Array.from(exportRoot.querySelectorAll("img")).map((image) => image.complete
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            image.addEventListener("load", () => resolve(), { once: true });
+            image.addEventListener("error", () => resolve(), { once: true });
+          })));
+
+      const maxCanvasSide = 12000;
+      const maxCanvasPixels = 80_000_000;
+      const captureScale = Math.max(0.5, Math.min(
+        3,
+        maxCanvasSide / exportWidth,
+        maxCanvasSide / exportHeight,
+        Math.sqrt(maxCanvasPixels / (exportWidth * exportHeight)),
+      ));
+      const canvas = await html2canvas(exportRoot, {
+        backgroundColor: "#15181e",
+        scale: captureScale,
+        useCORS: true,
+        logging: false,
+        width: exportWidth,
+        height: exportHeight,
+      });
+
+      // html2canvas/WebView cloning can silently omit data-URL images that replaced
+      // local videos. Paint decoded frames directly onto the final raster instead.
+      // This path uses board coordinates, so it does not depend on cloned DOM media.
+      const outputContext = canvas.getContext("2d");
+      if (outputContext && capturedVideoFrames.size > 0) {
+        const loadFrameImage = (src: string) => new Promise<HTMLImageElement>((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = () => reject(new Error("Could not decode an extracted video frame."));
+          image.src = src;
+        });
+
+        for (const { item, width, height } of itemSizes) {
+          const frameUrl = capturedVideoFrames.get(item.id);
+          if (!frameUrl || item.kind !== "media") continue;
+          try {
+            const frame = await loadFrameImage(frameUrl);
+            const targetX = (item.x - minX + padding) * captureScale;
+            const targetY = (item.y - minY + padding) * captureScale;
+            const targetWidth = width * captureScale;
+            const targetHeight = height * captureScale;
+            const sourceRatio = frame.naturalWidth / Math.max(1, frame.naturalHeight);
+            const targetRatio = targetWidth / Math.max(1, targetHeight);
+            let drawWidth = targetWidth;
+            let drawHeight = targetHeight;
+            if (sourceRatio > targetRatio) drawHeight = targetWidth / sourceRatio;
+            else drawWidth = targetHeight * sourceRatio;
+
+            outputContext.save();
+            outputContext.translate(targetX + targetWidth / 2, targetY + targetHeight / 2);
+            outputContext.rotate((item.rotation ?? 0) * Math.PI / 180);
+            outputContext.drawImage(frame, -drawWidth / 2, -drawHeight / 2, drawWidth, drawHeight);
+            outputContext.restore();
+          } catch (error) {
+            console.warn(`Could not paint video frame for board item ${item.id}`, error);
+          }
+        }
+      }
+      exportRoot.remove();
+
+      // Restore the live board before opening the native save dialog.
+      restoreVideoFrames();
+      restoreVideoFrames = null;
+      releaseInputLock();
+      releaseInputLock = null;
+
+      const pdfPointScale = Math.min(0.75, 14400 / Math.max(exportWidth, exportHeight));
+      const pageWidth = Math.max(1, exportWidth * pdfPointScale);
+      const pageHeight = Math.max(1, exportHeight * pdfPointScale);
+      const pdf = new jsPDF({
+        orientation: pageWidth >= pageHeight ? "landscape" : "portrait",
+        unit: "pt",
+        format: [pageWidth, pageHeight],
+        compress: true,
+        hotfixes: ["px_scaling"],
+      });
+      pdf.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, pageWidth, pageHeight, undefined, "FAST");
+
+      const safeName = currentBoard.name.replace(/[\\/:*?"<>|]+/g, "-").trim() || "board";
+      const path = await saveFileDialog({
+        title: "Export board to PDF",
+        defaultPath: `${safeName}.pdf`,
+        filters: [{ name: "PDF document", extensions: ["pdf"] }],
+      });
+      if (!path) return;
+      const bytes = Array.from(new Uint8Array(pdf.output("arraybuffer")));
+      await invoke("save_pdf_file", { path, bytes });
+    } catch (error) {
+      console.error("Board PDF export failed", error);
+      await message(`Could not export this board.\n\n${String(error)}`, { title: "Export to PDF", kind: "error" });
+    } finally {
+      restoreVideoFrames?.();
+      releaseInputLock?.();
+      document.querySelectorAll(".boardPdfExportRoot,.boardPdfInputLock").forEach((node) => node.remove());
+      setExportingPdf(false);
+    }
+  }
+
   function duplicateText(item: BoardItem) {
     const editor = textEditors.current.get(item.id);
     const copyId = crypto.randomUUID();
@@ -352,6 +745,7 @@ export default function BoardCanvasPage() {
       <input value={board.name} onChange={(event) => setBoard({ ...board, name: event.target.value })} />
       <span>{Math.round(view.zoom * 100)}%</span>
       <button className={hasUnsavedChanges ? "primary boardSaveDirty" : "boardSaveClean"} disabled={!hasUnsavedChanges} onClick={save}><Save size={16} /> {hasUnsavedChanges ? "Save board" : "Saved"}</button>
+      <button onClick={() => void exportToPdf()} disabled={exportingPdf}><FileDown size={16} /> {exportingPdf ? "Exporting…" : "Export to PDF"}</button>
     </div>
 
     <div
@@ -489,6 +883,7 @@ export default function BoardCanvasPage() {
           return <div
             ref={(node) => { if (node) itemElements.current.set(item.id, node); else itemElements.current.delete(item.id); }}
             key={item.id}
+            data-board-item-id={item.id}
             className={`boardItem ${item.kind === "media" ? "boardMediaItem" : "boardTextItem"}`}
             style={{ left: item.x, top: item.y, ...(item.kind === "media" ? { width: item.width, height: displayHeight } : {}) }}
             onPointerDown={(event) => beginItemDrag(event, item, media)}
@@ -542,7 +937,7 @@ export default function BoardCanvasPage() {
                 {collectionId && <span className="boardMediaTypeBadge boardComicBadge" aria-label="Comic"><BookOpen size={15} /></span>}
                 {media ? media.mediaType === "image"
                   ? <img src={getMediaUrl(media.filePath)} draggable={false} onDragStart={(event) => event.preventDefault()} />
-                  : <video src={getMediaUrl(media.filePath)} muted controls={isSelected} loop={media.isAnimatedGif} draggable={false}
+                  : <video src={getMediaUrl(media.filePath)} data-file-path={media.filePath} muted controls={isSelected} loop={media.isAnimatedGif} draggable={false}
                       onLoadedMetadata={(event) => {
                         const video = event.currentTarget;
                         if (video.videoWidth <= 0 || video.videoHeight <= 0) return;
