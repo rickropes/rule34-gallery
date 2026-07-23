@@ -112,7 +112,14 @@ fn extract_video_frame_png(path: String, time_seconds: f64) -> Result<Vec<u8>, S
         0.0
     };
 
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
@@ -167,7 +174,7 @@ fn save_pdf_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
 static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(desktop)]
-fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+fn show_main_window(app: &tauri::AppHandle, sync_mobile_queue: bool) -> tauri::Result<()> {
     use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
     if let Some(window) = app.get_webview_window("main") {
@@ -175,6 +182,9 @@ fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
         window.show()?;
         let _ = window.set_skip_taskbar(false);
         window.set_focus()?;
+        if sync_mobile_queue {
+            commands::mobile_queue::sync_mobile_queue_in_background(app.clone());
+        }
         return Ok(());
     }
 
@@ -191,6 +201,9 @@ fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
 
     window.show()?;
     window.set_focus()?;
+    if sync_mobile_queue {
+        commands::mobile_queue::sync_mobile_queue_in_background(app.clone());
+    }
     Ok(())
 }
 
@@ -211,7 +224,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => {
-                let _ = show_main_window(app);
+                let _ = show_main_window(app, true);
             }
             "quit" => {
                 QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -226,7 +239,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                let _ = show_main_window(tray.app_handle());
+                let _ = show_main_window(tray.app_handle(), true);
             }
         });
 
@@ -250,7 +263,7 @@ pub fn run() {
     {
         builder = builder
             .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-                let _ = show_main_window(app);
+                let _ = show_main_window(app, true);
             }))
             .plugin(tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -291,7 +304,8 @@ pub fn run() {
 
                 let background = std::env::args().any(|arg| arg == "--background");
                 if !background {
-                    show_main_window(app.handle())?;
+                    // The startup worker already performs the initial queue sync.
+                    show_main_window(app.handle(), false)?;
                 }
             }
 

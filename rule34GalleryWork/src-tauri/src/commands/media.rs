@@ -3,6 +3,15 @@ use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{fs, fs::File, io::{BufReader, Read, Write}, path::{Path, PathBuf}, process::{Command, Stdio}, time::{SystemTime, UNIX_EPOCH}};
 
+fn hide_subprocess_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 struct CopiedMedia {
     hash: String,
     original_filename: String,
@@ -435,6 +444,7 @@ fn image_resize_filter(filter: &str) -> image::imageops::FilterType {
 
 fn run_ffmpeg(input: &Path, output: &Path, operation: &str, extension: &str, resize_filter: &str) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
+    hide_subprocess_window(&mut command);
     command.arg("-y").arg("-hide_banner").arg("-loglevel").arg("error").arg("-i").arg(input);
 
     match operation {
@@ -484,7 +494,9 @@ fn resize_image(input: &Path, output: &Path, divisor: u32, resize_filter: &str) 
 }
 
 fn file_has_audio_stream(path: &Path) -> Result<bool, String> {
-    let output = Command::new("ffprobe")
+    let mut command = Command::new("ffprobe");
+    hide_subprocess_window(&mut command);
+    let output = command
         .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0"])
         .arg(path)
         .output()
@@ -503,25 +515,36 @@ fn file_has_audio_stream(path: &Path) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn media_ids_with_audio(media_ids: Vec<i64>, state: tauri::State<'_, AppState>) -> Result<Vec<i64>, String> {
+pub async fn media_ids_with_audio(media_ids: Vec<i64>, state: tauri::State<'_, AppState>) -> Result<Vec<i64>, String> {
     if media_ids.is_empty() { return Ok(Vec::new()); }
     let root = state.library_path.lock().map_err(|_| "Failed to access the library path.".to_string())?
         .clone().ok_or_else(|| "No library is currently open.".to_string())?;
-    let library = state.library_connection.lock().map_err(|_| "Failed to access the library database.".to_string())?;
-    let connection = library.as_ref().ok_or_else(|| "No library is currently open.".to_string())?;
-    let mut output = Vec::new();
-    for media_id in media_ids {
-        let row: Option<(String, String)> = connection.query_row(
-            "SELECT stored_filename, media_type FROM media WHERE id=?1",
-            [media_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).optional().map_err(|e| e.to_string())?;
-        let Some((stored_filename, media_type)) = row else { continue; };
-        if media_type != "video" { continue; }
-        let path = media_directory(&root, &media_type).join(stored_filename);
-        if file_has_audio_stream(&path)? { output.push(media_id); }
-    }
-    Ok(output)
+    let candidates = {
+        let library = state.library_connection.lock().map_err(|_| "Failed to access the library database.".to_string())?;
+        let connection = library.as_ref().ok_or_else(|| "No library is currently open.".to_string())?;
+        let mut candidates = Vec::new();
+        for media_id in media_ids {
+            let row: Option<(String, String)> = connection.query_row(
+                "SELECT stored_filename, media_type FROM media WHERE id=?1",
+                [media_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional().map_err(|e| e.to_string())?;
+            let Some((stored_filename, media_type)) = row else { continue; };
+            if media_type != "video" { continue; }
+            candidates.push((media_id, media_directory(&root, &media_type).join(stored_filename)));
+        }
+        candidates
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut output = Vec::new();
+        for (media_id, path) in candidates {
+            if file_has_audio_stream(&path)? { output.push(media_id); }
+        }
+        Ok::<Vec<i64>, String>(output)
+    })
+    .await
+    .map_err(|error| format!("Audio inspection task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -686,6 +709,7 @@ fn run_trim_ffmpeg(input: &Path, output: &Path, mode: &str, position_seconds: f6
         return Err("The trim position must be greater than zero.".to_string());
     }
     let mut command = Command::new("ffmpeg");
+    hide_subprocess_window(&mut command);
     command.args(["-y", "-hide_banner", "-loglevel", "error"]);
     match mode {
         "remove_start" => {
@@ -894,7 +918,9 @@ fn metadata_tag_names(extension: &str, media_type: &str) -> Vec<&'static str> {
 }
 
 fn is_short_silent_video(path: &Path) -> bool {
-    let output = match Command::new("ffprobe")
+    let mut command = Command::new("ffprobe");
+    hide_subprocess_window(&mut command);
+    let output = match command
         .args(["-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json"])
         .arg(path)
         .output()
@@ -932,7 +958,9 @@ fn convert_gif_to_mp4(source: &Path) -> Result<PathBuf, String> {
         .unwrap_or_default()
         .as_nanos());
     let output_path = std::env::temp_dir().join(format!("rule34-library-gif-{unique}.mp4"));
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    hide_subprocess_window(&mut command);
+    let output = command
         .args(["-y", "-loglevel", "error", "-i"])
         .arg(source)
         .args([
@@ -1033,7 +1061,9 @@ fn optimize_downloaded_video(source: &Path) -> Result<Option<PathBuf>, String> {
         .unwrap_or_default()
         .as_nanos());
     let output_path = std::env::temp_dir().join(format!("rule34-library-optimized-{unique}.mp4"));
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    hide_subprocess_window(&mut command);
+    let output = command
         .args(["-y", "-loglevel", "error", "-i"])
         .arg(source)
         .args([

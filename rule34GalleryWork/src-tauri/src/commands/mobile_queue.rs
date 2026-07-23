@@ -169,14 +169,20 @@ fn sync_mobile_queue_blocking(app: AppHandle) -> Result<MobileSyncResult, String
 
 pub fn start_mobile_queue_worker(app: AppHandle) {
     std::thread::spawn(move || {
-        // Give startup library initialization a moment to finish, then process
-        // immediately and continue while the tray application is alive.
+        // Give startup library initialization a moment to finish, then perform
+        // the single startup sync. Further syncs are explicitly triggered when
+        // the gallery is opened or the Mobile queue button is pressed.
         std::thread::sleep(Duration::from_secs(2));
-        loop {
-            if let Err(error) = sync_mobile_queue_blocking(app.clone()) {
-                eprintln!("Background mobile queue sync failed: {error}");
-            }
-            std::thread::sleep(Duration::from_secs(60));
+        if let Err(error) = sync_mobile_queue_blocking(app) {
+            eprintln!("Startup mobile queue sync failed: {error}");
+        }
+    });
+}
+
+pub fn sync_mobile_queue_in_background(app: AppHandle) {
+    std::thread::spawn(move || {
+        if let Err(error) = sync_mobile_queue_blocking(app) {
+            eprintln!("Gallery-open mobile queue sync failed: {error}");
         }
     });
 }

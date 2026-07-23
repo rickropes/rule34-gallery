@@ -23,6 +23,15 @@ use crate::{commands::media::{import_downloaded_media, is_valid_tag_name}, state
 
 const LISTEN_ADDRESS: &str = "127.0.0.1:37891";
 
+fn hide_subprocess_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImportRequest {
@@ -701,7 +710,9 @@ fn is_hls_media(url: &Url, content_type: &str) -> bool {
 fn download_hls_media(prefix: &str, url: &Url) -> Result<std::path::PathBuf, String> {
     let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     let temp = std::env::temp_dir().join(format!("{prefix}-{unique}.mp4"));
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    hide_subprocess_window(&mut command);
+    let output = command
         .args(["-y", "-loglevel", "error", "-i", url.as_str(), "-map", "0:v:0", "-map", "0:a?", "-c", "copy"])
         .arg(&temp)
         .output()
