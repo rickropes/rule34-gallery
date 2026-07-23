@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Gallery Post Importer settings</title>
+  <style>
+    body{font:14px system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 20px;color:#202124}
+    h1{font-size:24px} label{display:block;margin:18px 0 6px;font-weight:600}
+    input{box-sizing:border-box;width:100%;padding:10px;border:1px solid #c7c7c7;border-radius:6px}
+    button{margin-top:18px;padding:10px 18px;border:0;border-radius:6px;background:#1d9bf0;color:white;font-weight:700;cursor:pointer}
+    #status{margin-left:12px}.hint{color:#5f6368;line-height:1.5}
+  </style>
+</head>
+<body>
+  <h1>Gallery Post Importer</h1>
+  <p class="hint">When the desktop Gallery app cannot be reached, the extension can add the original post URL to the same Google Apps Script queue used by the Android share app.</p>
+  <label for="endpoint">Apps Script endpoint</label>
+  <input id="endpoint" type="url" placeholder="https://script.google.com/macros/s/.../exec">
+  <label for="token">Private token</label>
+  <input id="token" type="password" autocomplete="off">
+  <button id="save" type="button">Save</button><span id="status"></span>
+  <script src="options.js"></script>
+</body>
+</html>

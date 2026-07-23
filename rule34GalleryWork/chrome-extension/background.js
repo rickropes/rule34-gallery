@@ -6,7 +6,7 @@ const BSKY_MENU = "gallery-import-bsky";
 const NH_POOL_MENU = "gallery-add-collection-image";
 const LOCAL_ENDPOINT = "http://127.0.0.1:37891/import";
 
-function registerContextMenus() {
+chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({id:RULE34_MENU,title:"Import this Rule34 post into Gallery",contexts:["page"],documentUrlPatterns:["https://rule34.xxx/*","https://www.rule34.xxx/*"]});
     chrome.contextMenus.create({id:DANBOORU_MENU,title:"Import this Danbooru post into Gallery",contexts:["page","image","video"],documentUrlPatterns:["https://danbooru.donmai.us/posts/*","https://www.danbooru.donmai.us/posts/*"]});
@@ -15,11 +15,7 @@ function registerContextMenus() {
     chrome.contextMenus.create({id:BSKY_MENU,title:"Import this Bluesky post into Gallery",contexts:["page","image","video","link"],documentUrlPatterns:["https://bsky.app/*","https://www.bsky.app/*"]});
     chrome.contextMenus.create({id:NH_POOL_MENU,title:"Add image to Gallery pool",contexts:["image"],documentUrlPatterns:["https://nhentai.net/*","https://*.nhentai.net/*","https://e-hentai.org/*","https://*.e-hentai.org/*","https://exhentai.org/*","https://*.exhentai.org/*"]});
   });
-}
-
-chrome.runtime.onInstalled.addListener(registerContextMenus);
-chrome.runtime.onStartup.addListener(registerContextMenus);
-registerContextMenus();
+});
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id || !tab.url) return;
@@ -38,16 +34,8 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       payload=await chrome.tabs.sendMessage(tab.id,{type:"extract-x-post"});
       if(payload?.error) throw new Error(payload.error);
     } else if (info.menuItemId === BSKY_MENU) {
-      try {
-        payload=await chrome.tabs.sendMessage(tab.id,{type:"extract-bsky-post"});
-      } catch (_) {
-        payload=null;
-      }
+      payload=await chrome.tabs.sendMessage(tab.id,{type:"extract-bsky-post"});
       if(payload?.error) throw new Error(payload.error);
-      if(!payload?.url && /https:\/\/(?:www\.)?bsky\.app\/profile\/[^/]+\/post\/[^/?#]+/i.test(tab.url)) {
-        payload={url:tab.url,site:"bsky",mediaUrls:[],mediaTypes:[]};
-      }
-      if(!payload?.url) throw new Error("Could not identify the Bluesky post link.");
     } else return;
     await sendPayload(payload,true);
   } catch(error){ await notify("Gallery import failed",error.message); }
@@ -71,30 +59,9 @@ async function sendPayload(payload, allowQueue){
     if(!response.ok) throw new Error(result.error||`HTTP ${response.status}`);
     await notify("Import queued","The desktop app accepted the import.");
     return result;
-  }catch(localError){
-    if(!allowQueue) throw new Error(`Desktop app is not available. ${localError.message}`);
-    const queued=await appendToMobileQueue(payload?.url);
-    if(queued){
-      await notify("Import queued","The desktop app is offline. The post was added to the mobile queue.");
-      return {ok:true,queuedOffline:true};
-    }
-    throw new Error(`Desktop app is unavailable and the mobile queue is not configured. ${localError.message}`);
+  }catch(error){
+    if(!allowQueue) throw new Error(`Desktop app is not available. ${error.message}`);
+    throw error;
   }
-}
-
-async function appendToMobileQueue(url){
-  if(!url) return false;
-  const {mobileQueueEndpoint="",mobileQueueToken=""}=await chrome.storage.sync.get(["mobileQueueEndpoint","mobileQueueToken"]);
-  const endpoint=String(mobileQueueEndpoint||"").trim();
-  const token=String(mobileQueueToken||"").trim();
-  if(!endpoint||!token) return false;
-  const response=await fetch(endpoint,{
-    method:"POST",
-    headers:{"Content-Type":"text/plain;charset=utf-8"},
-    body:JSON.stringify({action:"append",token,url})
-  });
-  const result=await response.json().catch(()=>({}));
-  if(!response.ok||result.error||result.ok!==true) throw new Error(result.error||`Queue HTTP ${response.status}`);
-  return true;
 }
 function notify(title,message){return chrome.notifications.create({type:"basic",iconUrl:"icon128.png",title,message});}

@@ -136,6 +136,7 @@ pub(crate) fn enqueue_import_with_refresh(app: &AppHandle, payload: ImportReques
     let is_danbooru = host == "danbooru.donmai.us" || host == "www.danbooru.donmai.us";
     let is_gelbooru = host == "gelbooru.com" || host == "www.gelbooru.com";
     let is_x = matches!(host.as_str(), "x.com" | "www.x.com" | "twitter.com" | "www.twitter.com");
+    let is_bsky = matches!(host.as_str(), "bsky.app" | "www.bsky.app");
     let is_collection = payload.site.as_deref() == Some("collection");
 
     if is_rule34 {
@@ -162,13 +163,19 @@ pub(crate) fn enqueue_import_with_refresh(app: &AppHandle, payload: ImportReques
         if payload.media_urls.is_empty() {
             return Err("No downloadable images or videos were found in that X/Twitter post. For videos, play the post briefly and try again.".to_string());
         }
+    } else if is_bsky {
+        let parts: Vec<&str> = url.path_segments().map(|segments| segments.collect()).unwrap_or_default();
+        let valid_post = parts.len() >= 4 && parts[0] == "profile" && parts[2] == "post" && !parts[1].is_empty() && !parts[3].is_empty();
+        if !valid_post {
+            return Err("Right-click an individual Bluesky post before importing.".to_string());
+        }
     } else if is_collection {
         if payload.media_urls.is_empty() { return Err("The image pool is empty.".to_string()); }
         if payload.collection_metadata.is_none() && !collection_exists_for_source(app, &url)? {
             return Err("Add metadata before importing this new collection. Metadata can be omitted only when this gallery already exists in the library.".to_string());
         }
     } else {
-        return Err("Only Rule34, Danbooru, Gelbooru, X/Twitter, and extension collection payloads are supported.".to_string());
+        return Err("Only Rule34, Danbooru, Gelbooru, X/Twitter, Bluesky, and extension collection payloads are supported.".to_string());
     }
 
     let state = app.state::<AppState>();
@@ -191,6 +198,8 @@ pub(crate) fn enqueue_import_with_refresh(app: &AppHandle, payload: ImportReques
             process_booru_import(&worker_app, id, &url, BooruSite::Gelbooru)
         } else if is_x {
             process_x_import(&worker_app, id, &url, payload.artist.unwrap_or_default(), payload.media_urls, payload.media_types)
+        } else if is_bsky {
+            process_bsky_import(&worker_app, id, &url)
         } else {
             process_collection_import(&worker_app, id, &url, payload.media_urls, payload.media_page_numbers, payload.collection_metadata)
         };
@@ -408,6 +417,155 @@ fn process_collection_import(
     tx.commit().map_err(|e|e.to_string())?;
     for (_, temp) in temp_files { let _=std::fs::remove_file(temp); }
     Ok(format!("Added {} page{} to collection", imported.len(), if imported.len()==1 {""} else {"s"}))
+}
+
+
+fn process_bsky_import(app: &AppHandle, job_id: u64, page_url: &Url) -> Result<String, String> {
+    let parts: Vec<&str> = page_url.path_segments().map(|segments| segments.collect()).unwrap_or_default();
+    if parts.len() < 4 || parts[0] != "profile" || parts[2] != "post" {
+        return Err("Could not identify the Bluesky post.".to_string());
+    }
+    let profile = parts[1];
+    let record_key = parts[3];
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 Rule34Library/0.1")
+        .build().map_err(|e| e.to_string())?;
+    let did = if profile.starts_with("did:") {
+        profile.to_string()
+    } else {
+        let endpoint = Url::parse_with_params(
+            "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle",
+            &[("handle", profile)],
+        ).map_err(|e| e.to_string())?;
+        let json: serde_json::Value = client.get(endpoint).send()
+            .map_err(|e| format!("Failed to resolve Bluesky handle: {e}"))?
+            .error_for_status().map_err(|e| format!("Bluesky handle resolver returned an error: {e}"))?
+            .json().map_err(|e| format!("Invalid Bluesky handle response: {e}"))?;
+        json.get("did").and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Bluesky did not return an account identifier.".to_string())?.to_string()
+    };
+    let at_uri = format!("at://{did}/app.bsky.feed.post/{record_key}");
+    let endpoint = Url::parse_with_params(
+        "https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread",
+        &[("uri", at_uri.as_str()), ("depth", "0")],
+    ).map_err(|e| e.to_string())?;
+    set_job(app, job_id, "fetching", Some("Resolving Bluesky post".to_string()));
+    let json: serde_json::Value = client.get(endpoint).send()
+        .map_err(|e| format!("Failed to resolve Bluesky post: {e}"))?
+        .error_for_status().map_err(|e| format!("Bluesky post resolver returned an error: {e}"))?
+        .json().map_err(|e| format!("Invalid Bluesky post response: {e}"))?;
+    let post = json.pointer("/thread/post").ok_or_else(|| "Bluesky post data was missing.".to_string())?;
+    let full_handle = post.pointer("/author/handle").and_then(serde_json::Value::as_str)
+        .unwrap_or(profile).trim_start_matches('@');
+    let artist = full_handle.split('.').next().unwrap_or(full_handle).to_string();
+    let embed = post.get("embed");
+    let mut media_urls = Vec::new();
+    let mut media_types = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add_images = |images: Option<&Vec<serde_json::Value>>| {
+        if let Some(images) = images {
+            for image in images {
+                if let Some(raw) = image.get("fullsize").or_else(|| image.get("thumb")).and_then(serde_json::Value::as_str) {
+                    if seen.insert(raw.to_string()) { media_urls.push(raw.to_string()); media_types.push("image".to_string()); }
+                }
+            }
+        }
+    };
+    if let Some(embed) = embed {
+        add_images(embed.get("images").and_then(serde_json::Value::as_array));
+        add_images(embed.pointer("/media/images").and_then(serde_json::Value::as_array));
+        for pointer in ["/playlist", "/media/playlist"] {
+            if let Some(raw) = embed.pointer(pointer).and_then(serde_json::Value::as_str) {
+                if seen.insert(raw.to_string()) { media_urls.push(raw.to_string()); media_types.push("video".to_string()); }
+            }
+        }
+    }
+    if media_urls.is_empty() {
+        return Err("No downloadable images or videos were found in that Bluesky post.".to_string());
+    }
+    process_bsky_media_import(app, job_id, page_url, artist, media_urls, media_types)
+}
+
+fn process_bsky_media_import(
+    app: &AppHandle,
+    job_id: u64,
+    page_url: &Url,
+    artist: String,
+    media_urls: Vec<String>,
+    media_types: Vec<String>,
+) -> Result<String, String> {
+    let client = Client::builder().user_agent("Mozilla/5.0 Rule34Library/0.1").build().map_err(|e| e.to_string())?;
+    let mut images: Vec<(Url, Vec<u8>, String)> = Vec::new();
+    let mut videos: Vec<(Url, Vec<u8>, String)> = Vec::new();
+    for (index, raw) in media_urls.iter().enumerate() {
+        let url = Url::parse(raw).map_err(|e| format!("Invalid Bluesky media URL: {e}"))?;
+        validate_bsky_media_url(&url)?;
+        set_job(app, job_id, "downloading", Some(format!("Downloading {} of {}", index + 1, media_urls.len())));
+        let response = client.get(url.clone()).header(REFERER, page_url.as_str()).send()
+            .map_err(|e| format!("Failed to download Bluesky media: {e}"))?
+            .error_for_status().map_err(|e| format!("Bluesky media download returned an error: {e}"))?;
+        let content_type = response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let bytes = response.bytes().map_err(|e| format!("Failed to read Bluesky media: {e}"))?.to_vec();
+        let hinted = media_types.get(index).map(String::as_str).unwrap_or("");
+        if hinted == "video" || content_type.starts_with("video/") || is_video_path(&url) || is_hls_media(&url, &content_type) {
+            videos.push((url, bytes, content_type));
+        } else { images.push((url, bytes, content_type)); }
+    }
+    let state = app.state::<AppState>();
+    let root = state.library_path.lock().map_err(|_| "Failed to access library path.".to_string())?.clone()
+        .ok_or_else(|| "Open or configure a library before importing.".to_string())?;
+    let mut library = state.library_connection.lock().map_err(|_| "Failed to access library database.".to_string())?;
+    let connection = library.as_mut().ok_or_else(|| "Open or configure a library before importing.".to_string())?;
+    let post_id = page_url.path_segments().map(|segments| segments.collect::<Vec<_>>()).unwrap_or_default()
+        .windows(2).find(|pair| pair[0] == "post").map(|pair| pair[1].to_string()).unwrap_or_else(|| page_url.path().to_string());
+    let mut imported_count = 0usize;
+    if images.len() == 1 {
+        let temp = write_temp_media("bsky-image", &images[0].0, &images[0].1, &images[0].2)?;
+        let (media_id, _) = import_downloaded_media(&temp, &root, connection)?;
+        attach_source_and_artist_for_site(connection, media_id, page_url, &post_id, &artist, "bsky.app")?;
+        let _ = fs::remove_file(temp); imported_count += 1;
+    } else if images.len() > 1 {
+        let mut page_ids = Vec::with_capacity(images.len());
+        for (index, (url, bytes, content_type)) in images.iter().enumerate() {
+            set_job(app, job_id, "saving", Some(format!("Saving comic page {} of {}", index + 1, images.len())));
+            let temp = write_temp_media("bsky-comic-page", url, bytes, content_type)?;
+            let (media_id, imported) = import_downloaded_media(&temp, &root, connection)?;
+            let _ = fs::remove_file(&temp);
+            if imported {
+                attach_source_and_artist_for_site(connection, media_id, page_url, &post_id, &artist, "bsky.app")?;
+                page_ids.push(media_id);
+            }
+        }
+        if page_ids.len() < 2 { imported_count += page_ids.len(); }
+        else {
+            let title = format!("Bluesky post by @{}", artist.trim_start_matches('@'));
+            connection.execute("INSERT INTO collections(collection_type,title,source_url,source_external_id,cover_media_id,created_at) VALUES('bluesky_comic',?1,?2,?3,?4,datetime('now'))",
+                params![title, page_url.as_str(), post_id, page_ids[0]]).map_err(|e| format!("Failed to create Bluesky comic: {e}"))?;
+            let collection_id = connection.last_insert_rowid();
+            for (index, media_id) in page_ids.iter().enumerate() {
+                let position = index as i64 + 1;
+                connection.execute("INSERT INTO collection_pages(collection_id,media_id,page_number,position) VALUES(?1,?2,?3,?3)", params![collection_id, media_id, position])
+                    .map_err(|e| format!("Failed to add Bluesky comic page: {e}"))?;
+            }
+            attach_metadata_tag(connection, page_ids[0], "comic_hentai")?;
+            imported_count += 1;
+        }
+    }
+    for (index, (url, bytes, content_type)) in videos.iter().enumerate() {
+        set_job(app, job_id, "saving", Some(format!("Saving video {} of {}", index + 1, videos.len())));
+        let temp = write_temp_media("bsky-video", url, bytes, content_type)?;
+        let (media_id, _) = import_downloaded_media(&temp, &root, connection)?;
+        attach_source_and_artist_for_site(connection, media_id, page_url, &post_id, &artist, "bsky.app")?;
+        let _ = fs::remove_file(temp); imported_count += 1;
+    }
+    Ok(format!("Imported {imported_count} item(s) from Bluesky as artist:{artist}"))
+}
+
+fn validate_bsky_media_url(url: &Url) -> Result<(), String> {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host == "cdn.bsky.app" || host == "video.bsky.app" || host.ends_with(".bsky.app") || host.ends_with(".bsky.network") {
+        Ok(())
+    } else { Err(format!("Unsupported Bluesky media host: {host}")) }
 }
 
 fn process_x_import(
@@ -653,8 +811,19 @@ fn attach_source_and_artist(
     post_id: &str,
     artist: &str,
 ) -> Result<(), String> {
+    attach_source_and_artist_for_site(connection, media_id, page_url, post_id, artist, "x.com")
+}
+
+fn attach_source_and_artist_for_site(
+    connection: &mut rusqlite::Connection,
+    media_id: i64,
+    page_url: &Url,
+    post_id: &str,
+    artist: &str,
+    site: &str,
+) -> Result<(), String> {
     let tx = connection.transaction().map_err(|e| e.to_string())?;
-    tx.execute("INSERT OR IGNORE INTO sources(media_id,site,post_id,url,imported_at) VALUES(?1,'x.com',?2,?3,datetime('now'))", params![media_id, post_id, page_url.as_str()]).map_err(|e| e.to_string())?;
+    tx.execute("INSERT OR IGNORE INTO sources(media_id,site,post_id,url,imported_at) VALUES(?1,?2,?3,?4,datetime('now'))", params![media_id, site, post_id, page_url.as_str()]).map_err(|e| e.to_string())?;
     tx.execute("INSERT INTO tags(name,category) VALUES(?1,'artist') ON CONFLICT(name,category) DO NOTHING", params![artist]).map_err(|e| e.to_string())?;
     let tag_id: i64 = tx.query_row("SELECT id FROM tags WHERE name=?1 COLLATE NOCASE AND category='artist' COLLATE NOCASE", params![artist], |row| row.get(0)).map_err(|e| e.to_string())?;
     tx.execute("INSERT OR IGNORE INTO media_tags(media_id,tag_id) VALUES(?1,?2)", params![media_id, tag_id]).map_err(|e| e.to_string())?;
