@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { ExternalLink, FolderOpen, RefreshCw, ChevronLeft, ChevronRight, Maximize2, Minimize2, Scissors, Trash2, VolumeX, X } from "lucide-react";
+import { Copy, ExternalLink, FolderOpen, RefreshCw, ChevronLeft, ChevronRight, Maximize2, Minimize2, Scissors, Trash2, VolumeX, X } from "lucide-react";
 import { useAppStore } from "@/store/appStore";
 import { getMediaUrl } from "@/services/mediaService";
 import { listCollectionPages } from "@/tauri/mediaApi";
@@ -206,6 +206,19 @@ export default function Inspector() {
     [suggestions, name, tags],
   );
 
+  const twitterCopyUrl = useMemo(() => {
+    if (!media?.sourceUrl) return null;
+    try {
+      const source = new URL(media.sourceUrl);
+      const hostname = source.hostname.toLowerCase().replace(/^www\./, "");
+      if (hostname !== "x.com" && hostname !== "twitter.com" && !hostname.endsWith(".x.com") && !hostname.endsWith(".twitter.com")) return null;
+      source.hostname = "fixupx.com";
+      return source.toString();
+    } catch {
+      return null;
+    }
+  }, [media?.sourceUrl]);
+
   if (!media) return <aside className="inspector emptyInspector">Select media to inspect tags and details.</aside>;
 
   const previewMedia = collectionPages[collectionIndex] ?? media;
@@ -347,6 +360,16 @@ export default function Inspector() {
     }
   }
 
+  async function copyTwitterLink() {
+    if (!twitterCopyUrl) return;
+    try {
+      await navigator.clipboard.writeText(twitterCopyUrl);
+      setOperationStatus("Copied fixupx.com link to clipboard.");
+    } catch (cause) {
+      setOperationStatus(`Copy failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  }
+
   function openViewer() {
     videoRef.current?.pause();
     setViewerOpen(true);
@@ -430,6 +453,11 @@ export default function Inspector() {
                   <Scissors size={16} /> Remove End
                 </button>
               </>
+            )}
+            {!multiple && twitterCopyUrl && (
+              <button disabled={busy} onClick={() => void copyTwitterLink()} title="Copy the source post as a fixupx.com link">
+                <Copy size={16} /> Copy
+              </button>
             )}
           </div>
           <p className="muted">/2 reduces width and height to 50%; /4 reduces both to 25%. Trim buttons cut at the video player’s current position. These actions replace the original stored file.</p>
