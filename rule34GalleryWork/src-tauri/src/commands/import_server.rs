@@ -1134,7 +1134,10 @@ fn parse_rule34_page(page_url: Url, html: &str) -> Result<ParsedPost, String> {
         .filter_map(|node| {
             let href = node.value().attr("href")?;
             let label = node.text().collect::<String>();
-            if label.trim().eq_ignore_ascii_case("Original image")
+            let normalized_label = label.trim().to_ascii_lowercase();
+            if (normalized_label == "original image"
+                || normalized_label == "original file"
+                || normalized_label == "download original")
                 && is_rule34_media_url(&page_url, href)
             {
                 Some(href.to_string())
@@ -1149,6 +1152,15 @@ fn parse_rule34_page(page_url: Url, html: &str) -> Result<ParsedPost, String> {
         .as_ref()
         .and_then(|node| node.value().attr("src"))
         .map(str::to_string);
+    let original_image_attribute = image
+        .as_ref()
+        .and_then(|node| node.value().attr("data-original-file-url").or_else(|| node.value().attr("data-file-url")))
+        .filter(|value| is_rule34_media_url(&page_url, value))
+        .map(str::to_string);
+    let original_media = original_media_link
+        .clone()
+        .or(original_image_attribute)
+        .or_else(|| extract_rule34_original_media_url(html));
     let image_is_animated_gif = image
         .as_ref()
         .and_then(|node| node.value().attr("alt"))
@@ -1159,14 +1171,16 @@ fn parse_rule34_page(page_url: Url, html: &str) -> Result<ParsedPost, String> {
     // runs in the browser. The desktop importer does not execute page JavaScript,
     // so resolve the original GIF URL directly instead of downloading the sample.
     let mut media_src = if image_is_animated_gif {
-        original_media_link
+        original_media
             .as_ref()
             .filter(|href| media_url_has_extension(&page_url, href, &["gif"]))
             .cloned()
             .or_else(|| extract_rule34_url_with_extensions(html, &["gif"]))
             .or_else(|| image_src.as_deref().and_then(|src| derive_original_gif_url(&page_url, src)))
     } else {
-        image_src.clone()
+        // The visible image src is commonly /samples/sample_*. The page's
+        // Post.highres() action swaps it for the original /images/* asset.
+        original_media.or_else(|| image_src.clone())
     };
 
     // Video markup differs between the raw response and browser-saved DOM. Scan all
@@ -1288,6 +1302,40 @@ fn extract_rule34_media_url(html: &str) -> Option<String> {
     extract_rule34_url_with_extensions(html, &["mp4", "webm", "mov", "m4v"])
 }
 
+fn extract_rule34_original_media_url(html: &str) -> Option<String> {
+    let normalized = html.replace("\\/", "/").replace("\\u0026", "&");
+    let mut offset = 0;
+    while let Some(relative_start) = normalized[offset..].find("https://") {
+        let start = offset + relative_start;
+        let remainder = &normalized[start..];
+        let end = remainder
+            .find(|ch: char| matches!(ch, '"' | '\'' | '<' | '>' | ' ' | '\n' | '\r' | '\t'))
+            .unwrap_or(remainder.len());
+        let candidate = remainder[..end].replace("&amp;", "&");
+        if let Ok(url) = Url::parse(&candidate) {
+            let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+            let owned_host = host == "rule34.xxx" || host.ends_with(".rule34.xxx");
+            let path = url.path().to_ascii_lowercase();
+            let is_original_path = path.contains("/images/")
+                && !path.contains("/samples/")
+                && !path.contains("/thumbnails/");
+            let supported_extension = matches!(
+                Path::new(url.path())
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.to_ascii_lowercase())
+                    .as_deref(),
+                Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "mp4" | "webm" | "mov" | "m4v")
+            );
+            if owned_host && is_original_path && supported_extension {
+                return Some(candidate);
+            }
+        }
+        offset = start + "https://".len();
+    }
+    None
+}
+
 fn extract_rule34_url_with_extensions(html: &str, extensions: &[&str]) -> Option<String> {
     let mut offset = 0;
     while let Some(relative_start) = html[offset..].find("https://") {
@@ -1329,4 +1377,31 @@ fn media_extension(url: &Url, content_type: &str) -> Result<String, String> {
 #[tauri::command]
 pub fn list_import_queue(state: tauri::State<'_, AppState>) -> Result<Vec<ImportJob>, String> {
     Ok(state.import_queue.lock().map_err(|_| "Failed to access import queue.".to_string())?.iter().cloned().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rule34_prefers_original_link_over_sample_image() {
+        let page = Url::parse("https://rule34.xxx/index.php?page=post&s=view&id=123").unwrap();
+        let html = r#"
+            <img id="image" src="https://wimg.rule34.xxx/samples/12/sample_hash.jpg">
+            <a href="https://wimg.rule34.xxx/images/12/hash.png">Original image</a>
+        "#;
+        let parsed = parse_rule34_page(page, html).unwrap();
+        assert_eq!(parsed.media_url.as_str(), "https://wimg.rule34.xxx/images/12/hash.png");
+    }
+
+    #[test]
+    fn rule34_finds_embedded_highres_url() {
+        let page = Url::parse("https://rule34.xxx/index.php?page=post&s=view&id=456").unwrap();
+        let html = r#"
+            <img id="image" src="https://wimg.rule34.xxx/samples/34/sample_hash.jpg">
+            <script>Post.register({file_url:"https:\/\/wimg.rule34.xxx\/images\/34\/hash.jpg"});</script>
+        "#;
+        let parsed = parse_rule34_page(page, html).unwrap();
+        assert_eq!(parsed.media_url.as_str(), "https://wimg.rule34.xxx/images/34/hash.jpg");
+    }
 }

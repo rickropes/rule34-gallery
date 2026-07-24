@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { Copy, ExternalLink, FolderOpen, RefreshCw, ChevronLeft, ChevronRight, Maximize2, Minimize2, Scissors, Trash2, VolumeX, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, ArrowUpDown, Copy, ExternalLink, FolderOpen, GripVertical, RefreshCw, ChevronLeft, ChevronRight, Maximize2, Minimize2, Save, Scissors, Trash2, VolumeX, X } from "lucide-react";
 import { useAppStore } from "@/store/appStore";
 import { getMediaUrl } from "@/services/mediaService";
 import { listCollectionPages } from "@/tauri/mediaApi";
@@ -13,6 +13,7 @@ import {
 import {
   deleteMedia,
   deleteComicPage,
+  reorderCollectionPages,
   listMedia,
   processMedia,
   mediaIdsWithAudio,
@@ -55,6 +56,7 @@ export default function Inspector() {
   const viewerOpen = useAppStore((s) => s.viewerOpen);
   const videoRef = useRef<HTMLVideoElement>(null);
   const inspectorRef = useRef<HTMLElement>(null);
+  const draggedPageIdRef = useRef<number | null>(null);
   const previewResizeHandleRef = useRef<HTMLDivElement>(null);
   const previewDragStart = useRef<{ y: number; height: number } | null>(null);
   const savedPreviewHeight = Number(localStorage.getItem(PREVIEW_HEIGHT_STORAGE_KEY));
@@ -66,6 +68,9 @@ export default function Inspector() {
   const [isResizingPreview, setIsResizingPreview] = useState(false);
   const [collectionPages, setCollectionPages] = useState<MediaRecord[]>([]);
   const [collectionIndex, setCollectionIndex] = useState(0);
+  const [reorderOpen, setReorderOpen] = useState(false);
+  const [reorderPages, setReorderPages] = useState<MediaRecord[]>([]);
+  const [draggedPageId, setDraggedPageId] = useState<number | null>(null);
 
   const [category, setCategory] = useState("");
   const [name, setName] = useState("");
@@ -301,6 +306,60 @@ export default function Inspector() {
     }
   }
 
+  function openPageReorder() {
+    setReorderPages([...collectionPages]);
+    draggedPageIdRef.current = null;
+    setDraggedPageId(null);
+    setReorderOpen(true);
+  }
+
+  function moveReorderPage(sourceId: number, targetId: number) {
+    if (sourceId === targetId) return;
+    setReorderPages((current) => {
+      const sourceIndex = current.findIndex((page) => page.id === sourceId);
+      const targetIndex = current.findIndex((page) => page.id === targetId);
+      if (sourceIndex < 0 || targetIndex < 0) return current;
+      const next = [...current];
+      const [source] = next.splice(sourceIndex, 1);
+      next.splice(targetIndex, 0, source);
+      return next;
+    });
+  }
+
+  function stepReorderPage(pageId: number, direction: -1 | 1) {
+    setReorderPages((current) => {
+      const index = current.findIndex((page) => page.id === pageId);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= current.length) return current;
+      const next = [...current];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }
+
+  async function savePageOrder() {
+    const collectionId = media?.collectionId;
+    if (!collectionId || reorderPages.length !== collectionPages.length) return;
+    setBusy(true);
+    setOperationStatus("Saving comic page order…");
+    try {
+      await reorderCollectionPages(collectionId, reorderPages.map((page) => page.id));
+      const savedPages = reorderPages.map((page) => ({ ...page, collectionPageCount: reorderPages.length }));
+      const newCover = savedPages[0];
+      setCollectionPages(savedPages);
+      setCollectionIndex(0);
+      setSelectedMediaSelection(newCover, [newCover.id]);
+      setReorderOpen(false);
+      bump();
+      window.dispatchEvent(new Event("rule34-library:force-gallery-refresh"));
+      setOperationStatus("Comic page order saved.");
+    } catch (cause) {
+      setOperationStatus(`Could not reorder comic pages: ${cause instanceof Error ? cause.message : String(cause)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runOperation(operation: "half_size" | "quarter_size" | "remove_audio") {
     const ids = operation === "remove_audio" ? audioVideoIds : selectedIds;
     if (!ids.length) return;
@@ -424,6 +483,7 @@ export default function Inspector() {
             <p className="muted">{multiple ? "Bulk editing mode" : `${media.mediaType} · ${media.extension.toUpperCase()} · ${formatSize(media.filesize)}`}</p>
           </div>
           <div className="inspectorDeleteActions">
+            {!multiple && collectionPages.length > 1 && <button disabled={busy} onClick={openPageReorder}><ArrowUpDown size={16} /> Reorder pages</button>}
             {!multiple && collectionPages.length > 1 && <button className="danger" disabled={busy} onClick={() => void removeCurrentComicPage()}><Trash2 size={16} /> Delete Page</button>}
             <button className="danger" disabled={busy} onClick={() => void removeSelected()}><Trash2 size={16} /> Delete</button>
           </div>
@@ -569,6 +629,73 @@ export default function Inspector() {
             <div className="reimportModalActions">
               <button type="button" disabled={busy} onClick={() => setReimportOpen(false)}>Cancel</button>
               <button type="button" className="primary" disabled={busy || (!reimportMedia && !reimportMetadata)} onClick={() => void runReimport()}>{busy ? "Reimporting…" : "Reimport"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {reorderOpen && (
+        <div className="comicReorderBackdrop" role="presentation" onMouseDown={() => !busy && setReorderOpen(false)}>
+          <div className="comicReorderModal" role="dialog" aria-modal="true" aria-labelledby="comic-reorder-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="comicReorderHeader">
+              <div>
+                <h3 id="comic-reorder-title">Reorder comic pages</h3>
+                <p>Drag pages into the order you want. The first page becomes the comic cover.</p>
+              </div>
+              <button type="button" aria-label="Close" disabled={busy} onClick={() => setReorderOpen(false)}><X size={18} /></button>
+            </div>
+            <div className="comicReorderGrid">
+              {reorderPages.map((page, index) => (
+                <div
+                  key={page.id}
+                  data-reorder-page-id={page.id}
+                  className={`comicReorderPage ${draggedPageId === page.id ? "dragging" : ""}`}
+                  onPointerDown={(event) => {
+                    if (busy || event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
+                    event.preventDefault();
+                    draggedPageIdRef.current = page.id;
+                    setDraggedPageId(page.id);
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                  }}
+                  onPointerMove={(event) => {
+                    const sourceId = draggedPageIdRef.current;
+                    if (sourceId === null) return;
+                    event.preventDefault();
+                    const target = document.elementFromPoint(event.clientX, event.clientY)
+                      ?.closest<HTMLElement>("[data-reorder-page-id]");
+                    const targetId = Number(target?.dataset.reorderPageId);
+                    if (targetId && targetId !== sourceId) moveReorderPage(sourceId, targetId);
+                  }}
+                  onPointerUp={(event) => {
+                    event.preventDefault();
+                    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                      event.currentTarget.releasePointerCapture(event.pointerId);
+                    }
+                    draggedPageIdRef.current = null;
+                    setDraggedPageId(null);
+                  }}
+                  onPointerCancel={() => {
+                    draggedPageIdRef.current = null;
+                    setDraggedPageId(null);
+                  }}
+                >
+                  <div className="comicReorderThumb">
+                    {page.mediaType === "image"
+                      ? <img src={getMediaUrl(page.filePath)} alt={`Page ${index + 1}`} draggable={false} />
+                      : <video src={getMediaUrl(page.filePath)} muted preload="metadata" draggable={false} />}
+                    <span>{index + 1}</span>
+                  </div>
+                  <div className="comicReorderPageControls">
+                    <GripVertical size={16} aria-hidden="true" />
+                    <span>Page {index + 1}</span>
+                    <button type="button" title="Move page left" aria-label={`Move page ${index + 1} left`} disabled={busy || index === 0} onClick={() => stepReorderPage(page.id, -1)}><ArrowLeft size={14} /></button>
+                    <button type="button" title="Move page right" aria-label={`Move page ${index + 1} right`} disabled={busy || index === reorderPages.length - 1} onClick={() => stepReorderPage(page.id, 1)}><ArrowRight size={14} /></button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="comicReorderActions">
+              <button type="button" disabled={busy} onClick={() => setReorderOpen(false)}>Cancel</button>
+              <button type="button" className="primary" disabled={busy} onClick={() => void savePageOrder()}><Save size={16} /> {busy ? "Saving…" : "Save order"}</button>
             </div>
           </div>
         </div>

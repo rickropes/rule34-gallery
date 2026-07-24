@@ -119,6 +119,52 @@ pub fn list_media(
     Ok(MediaPage { items, total, offset: page_offset, limit: page_limit })
 }
 
+#[tauri::command]
+pub fn list_media_by_ids(
+    media_ids: Vec<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<MediaRecord>, String> {
+    if media_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let library = state.library_connection.lock().map_err(|_| "Failed to access the library database.".to_string())?;
+    let connection = library.as_ref().ok_or_else(|| "No library is currently open.".to_string())?;
+    let root = state.library_path.lock().map_err(|_| "Failed to access the library path.".to_string())?
+        .clone().ok_or_else(|| "No library is currently open.".to_string())?;
+    let placeholders = (1..=media_ids.len()).map(|index| format!("?{index}")).collect::<Vec<_>>().join(",");
+    let query = format!(r#"
+        SELECT m.id,m.hash,m.original_filename,m.stored_filename,m.extension,m.media_type,
+               m.width,m.height,m.filesize,m.favorite,m.added_at,
+               (SELECT s.url FROM sources s WHERE s.media_id=m.id ORDER BY s.id DESC LIMIT 1) AS source_url,
+               EXISTS(
+                 SELECT 1 FROM media_tags mt
+                 INNER JOIN tags t ON t.id=mt.tag_id
+                 WHERE mt.media_id=m.id
+                   AND lower(t.category)='metadata'
+                   AND lower(t.name) IN ('gif','animated_gif')
+               ) AS is_animated_gif,
+               (SELECT cp.collection_id FROM collection_pages cp WHERE cp.media_id=m.id LIMIT 1) AS collection_id,
+               COALESCE((SELECT COUNT(*) FROM collection_pages cp2 WHERE cp2.collection_id=(SELECT cp3.collection_id FROM collection_pages cp3 WHERE cp3.media_id=m.id LIMIT 1)),0) AS collection_page_count
+        FROM media m
+        WHERE m.id IN ({placeholders})
+        ORDER BY m.id
+    "#);
+    let mut statement = connection.prepare(&query).map_err(|e| format!("Failed to prepare board media query: {e}"))?;
+    let rows = statement.query_map(rusqlite::params_from_iter(media_ids), |row| {
+        let media_type: String = row.get(5)?;
+        let stored_filename: String = row.get(3)?;
+        Ok(MediaRecord {
+            id: row.get(0)?, hash: row.get(1)?, original_filename: row.get(2)?, stored_filename: stored_filename.clone(),
+            extension: row.get(4)?, media_type: media_type.clone(), width: row.get(6)?, height: row.get(7)?,
+            filesize: row.get(8)?, favorite: row.get::<_, i64>(9)? != 0, added_at: row.get(10)?,
+            file_path: media_directory(&root, &media_type).join(stored_filename).to_string_lossy().into_owned(),
+            source_url: row.get(11)?, is_animated_gif: row.get::<_, i64>(12)? != 0,
+            collection_id: row.get(13)?, collection_page_count: row.get(14)?,
+        })
+    }).map_err(|e| format!("Failed to query board media: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Failed to read board media row: {e}"))
+}
+
 #[derive(Debug)]
 struct SearchTerm {
     value: String,
@@ -382,6 +428,73 @@ pub fn list_collection_pages(collection_id: i64, state: tauri::State<'_, AppStat
         Ok(MediaRecord{id:row.get(0)?,hash:row.get(1)?,original_filename:row.get(2)?,stored_filename:stored_filename.clone(),extension:row.get(4)?,media_type:media_type.clone(),width:row.get(6)?,height:row.get(7)?,filesize:row.get(8)?,favorite:row.get::<_,i64>(9)?!=0,added_at:row.get(10)?,file_path:media_directory(&root,&media_type).join(stored_filename).to_string_lossy().into_owned(),source_url:row.get(11)?,is_animated_gif:row.get::<_,i64>(12)?!=0,collection_id:row.get(13)?,collection_page_count:row.get(14)?})
     }).map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+}
+
+#[tauri::command]
+pub fn reorder_collection_pages(
+    collection_id: i64,
+    media_ids: Vec<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<ComicOperationResult, String> {
+    if media_ids.is_empty() {
+        return Err("A comic must contain at least one page.".to_string());
+    }
+    let unique_ids = media_ids.iter().copied().collect::<std::collections::HashSet<_>>();
+    if unique_ids.len() != media_ids.len() {
+        return Err("The reordered page list contains duplicates.".to_string());
+    }
+
+    let mut library = state.library_connection.lock().map_err(|_| "Failed to access the library database.".to_string())?;
+    let connection = library.as_mut().ok_or_else(|| "No library is currently open.".to_string())?;
+    let tx = connection.transaction().map_err(|e| e.to_string())?;
+    let existing = {
+        let mut statement = tx.prepare(
+            "SELECT media_id FROM collection_pages WHERE collection_id=?1 ORDER BY position,page_number"
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([collection_id], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    let existing_ids = existing.iter().copied().collect::<std::collections::HashSet<_>>();
+    if existing_ids != unique_ids {
+        return Err("The reordered pages do not match the comic's current pages. Reload the comic and try again.".to_string());
+    }
+    let old_cover: i64 = tx.query_row(
+        "SELECT cover_media_id FROM collections WHERE id=?1",
+        [collection_id],
+        |row| row.get(0),
+    ).map_err(|_| "Comic was not found.".to_string())?;
+
+    // Move existing positions out of the positive key range before assigning
+    // the new order because (collection_id, position) is the primary key.
+    tx.execute("UPDATE collection_pages SET position=-position WHERE collection_id=?1", [collection_id])
+        .map_err(|e| e.to_string())?;
+    for (index, media_id) in media_ids.iter().enumerate() {
+        let position = index as i64 + 1;
+        tx.execute(
+            "UPDATE collection_pages SET page_number=?1,position=?1 WHERE collection_id=?2 AND media_id=?3",
+            params![position, collection_id, media_id],
+        ).map_err(|e| e.to_string())?;
+    }
+
+    let new_cover = media_ids[0];
+    if new_cover != old_cover {
+        // Collection tags and its source link live on the cover record.
+        tx.execute(
+            "INSERT OR IGNORE INTO media_tags(media_id,tag_id) SELECT ?1,tag_id FROM media_tags WHERE media_id=?2",
+            params![new_cover, old_cover],
+        ).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO sources(media_id,site,post_id,url,imported_at) SELECT ?1,site,post_id,url,imported_at FROM sources WHERE media_id=?2",
+            params![new_cover, old_cover],
+        ).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE collections SET cover_media_id=?1 WHERE id=?2", params![new_cover, collection_id])
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(ComicOperationResult { cover_media_id: new_cover, affected_count: media_ids.len() })
 }
 
 #[tauri::command]

@@ -4,7 +4,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { loadBoards, updateBoard } from "@/services/boardService";
 import { useAppStore } from "@/store/appStore";
 import { getMediaUrl } from "@/services/mediaService";
-import { listCollectionPages, listMedia } from "@/tauri/mediaApi";
+import { listCollectionPages, listMedia, listMediaByIds } from "@/tauri/mediaApi";
 import type { MediaRecord } from "@/types/media";
 import type { BoardItem, BoardRecord } from "@/types/board";
 import html2canvas from "html2canvas";
@@ -75,12 +75,25 @@ export default function BoardCanvasPage() {
   const viewRef = useRef<ViewState>(initial?.viewport ?? { x: 0, y: 0, zoom: 1 });
   const savedSnapshot = useRef("");
   const savedTextRevision = useRef(0);
+  const boardMediaIdKey = useMemo(() => board?.items
+    .filter((item) => item.kind === "media" && typeof item.mediaId === "number")
+    .map((item) => item.mediaId as number)
+    .sort((a, b) => a - b)
+    .join(",") ?? "", [board?.items]);
 
   useEffect(() => {
-    void listMedia("", "", "", 0, 10000)
-      .then((page) => setBoardMedia(page.items))
+    const boardIds = boardMediaIdKey ? boardMediaIdKey.split(",").map(Number) : [];
+    void Promise.all([
+      listMedia("", "", "", 0, 10000),
+      listMediaByIds(boardIds),
+    ])
+      .then(([page, placedMedia]) => {
+        const byId = new Map(page.items.map((item) => [item.id, item]));
+        placedMedia.forEach((item) => byId.set(item.id, item));
+        setBoardMedia([...byId.values()]);
+      })
       .catch(() => setBoardMedia(gallery));
-  }, [gallery, libraryVersion]);
+  }, [gallery, libraryVersion, boardMediaIdKey]);
 
   useEffect(() => {
     if (!board) return;

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
-import { Search, Link as LinkIcon, Upload, CalendarDays, Smartphone, LayoutDashboard, Images } from "lucide-react";
+import { Search, CircleHelp, Link as LinkIcon, Upload, CalendarDays, Smartphone, LayoutDashboard, Images } from "lucide-react";
 import { selectAndImportMedia } from "@/services/importService";
 import { importMediaUrl, listSearchSuggestions } from "@/tauri/mediaApi";
 import { syncMobileQueue } from "@/tauri/mobileQueueApi";
@@ -58,7 +58,23 @@ export default function TopBar() {
   return <>
     <header className="topbar">
       <div className="searchWrap" ref={searchWrap}>
-        <div className="searchBox"><Search size={17}/><input value={search} onFocus={()=>setShowSuggestions(true)} onChange={e=>{setSearch(e.target.value);setShowSuggestions(true);}} placeholder='Search tags or sources, e.g. site:x.com'/></div>
+        <div className="searchBox">
+          <Search size={17}/>
+          <input value={search} onFocus={()=>setShowSuggestions(true)} onChange={e=>{setSearch(e.target.value);setShowSuggestions(true);}} placeholder='Search tags or sources, e.g. site:x.com'/>
+          <span className="searchHelp" tabIndex={0} aria-label="Search filter help">
+            <CircleHelp size={17}/>
+            <span className="searchHelpTooltip" role="tooltip">
+              <strong>Search filters</strong>
+              <code>category:tag</code><span>Tag within a category</span>
+              <code>site:example.com</code><span>Source website</span>
+              <code>bigsize:2000</code><span>Images larger than 2000 px</span>
+              <code>board:Board Name</code><span>Media used on a board</span>
+              <code>"exact tag"</code><span>Exact tag or category</span>
+              <code>-category:tag</code><span>Exclude a match</span>
+              <small>Multiple filters are combined with AND.</small>
+            </span>
+          </span>
+        </div>
         {showSuggestions&&suggestions.length>0&&<div className="searchSuggestions">
           {suggestions.map(value=><button key={value} type="button" onPointerDown={e=>e.preventDefault()} onClick={()=>chooseSuggestion(value)}>{value.includes(":")?<><b>{value.split(":",1)[0]}</b>:{value.slice(value.indexOf(":")+1)}</>:<><b>{value}</b><span>category</span></>}</button>)}
         </div>}

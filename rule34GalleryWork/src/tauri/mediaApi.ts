@@ -5,6 +5,7 @@ export interface ImportMediaResult { importedCount:number; skippedCount:number; 
 export interface ProcessMediaResult { processedCount:number; errors:string[] }
 export async function ping(){return invoke<string>("ping")}
 export async function listMedia(search="",addedFrom="",addedTo="",offset=0,limit=80){return invoke<MediaPage>("list_media",{search:search||null,addedFrom:addedFrom?`${addedFrom} 00:00:00`:null,addedTo:addedTo?`${addedTo} 23:59:59`:null,offset,limit})}
+export async function listMediaByIds(mediaIds:number[]){return invoke<import("@/types/media").MediaRecord[]>("list_media_by_ids",{mediaIds})}
 export async function importMediaFiles(paths:string[]){return invoke<ImportMediaResult>("import_media_files",{paths})}
 export async function importMediaUrl(url:string,tags:string[]){return invoke<ImportMediaResult>("import_media_url",{url,tags})}
 export async function deleteMedia(mediaIds:number[]){return invoke<number>("delete_media",{mediaIds})}
@@ -15,6 +16,7 @@ export function getMediaAssetUrl(filePath:string){return convertFileSrc(filePath
 
 export async function listSearchSuggestions(query:string){return invoke<string[]>("list_search_suggestions",{query:query||null})}
 export async function listCollectionPages(collectionId:number){return invoke<import("@/types/media").MediaRecord[]>("list_collection_pages",{collectionId})}
+export async function reorderCollectionPages(collectionId:number,mediaIds:number[]){return invoke<ComicOperationResult>("reorder_collection_pages",{collectionId,mediaIds})}
 
 export async function mergeMediaImages(mediaIds:number[]){return invoke<ImportMediaResult>("merge_media_images",{mediaIds})}
 export interface ComicOperationResult { coverMediaId:number; affectedCount:number }

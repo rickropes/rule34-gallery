@@ -8,6 +8,7 @@ use commands::import_server::reimport_media;
 use commands::{
     library::get_media_count,
     media::list_media,
+    media::list_media_by_ids,
     media::insert_test_media,
     media::import_media_files,
     media::list_media_tags,
@@ -23,6 +24,7 @@ use commands::{
     media::media_ids_with_audio,
     media::trim_video,
     media::list_collection_pages,
+    media::reorder_collection_pages,
     media::merge_media_images,
     media::create_comic_from_images, media::add_images_to_comic, media::merge_comics_into_first, media::merge_comic_pages, media::delete_comic_page, media::cleanup_invalid_tags
 };
@@ -334,6 +336,7 @@ pub fn run() {
             commands::library::open_configured_library,
             get_media_count,
             list_media,
+            list_media_by_ids,
             insert_test_media,
             import_media_files,
             list_media_tags,
@@ -350,6 +353,7 @@ pub fn run() {
             media_ids_with_audio,
             trim_video,
             list_collection_pages,
+            reorder_collection_pages,
             merge_media_images,
             create_comic_from_images,
             add_images_to_comic,
