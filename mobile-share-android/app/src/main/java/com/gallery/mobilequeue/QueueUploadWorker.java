@@ -22,7 +22,6 @@ import java.net.HttpURLConnection;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
-import java.net.URLEncoder;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.locks.ReentrantLock;
@@ -205,17 +204,10 @@ public class QueueUploadWorker extends Worker {
             return UploadResult.failure("Waiting for a validated internet connection", true);
         }
 
-        // Before using the v2 append receipt, confirm once that the deployed
-        // Apps Script advertises that protocol. This one-time handshake still
-        // follows ContentService's response redirect; after it succeeds, append
-        // itself never depends on script.googleusercontent.com again.
-        if (!PendingQueueStore.isAppendReceiptV2Confirmed(context)) {
-            UploadResult capability = confirmAppendReceiptProtocol(context);
-            if (!capability.ok) {
-                return capability;
-            }
-            PendingQueueStore.confirmAppendReceiptV2(context);
-        }
+        // The currently deployed Apps Script uses append-receipt protocol v2.
+        // A successful append returns ContentService only AFTER the URL is in
+        // queue.txt, so the initial redirect itself is the receipt. Normal
+        // response URL; that host has proven unreliable on this network.
 
         // Do NOT pin the HTTP socket to a Network snapshot. URL.openConnection()
         // uses Android's current default route, so a fresh retry can follow
@@ -350,12 +342,11 @@ public class QueueUploadWorker extends Worker {
                 }
                 URL redirectUrl = new URL(endpoint, location);
 
-                // Protocol v2 guarantee: after capabilities were confirmed, the
-                // server returns a ContentService redirect to googleusercontent
-                // ONLY AFTER append/dedup has completed. The redirect itself is
-                // therefore the receipt. Do not resolve/fetch the one-time URL.
-                if (PendingQueueStore.isAppendReceiptV2Confirmed(context)
-                    && "script.googleusercontent.com".equalsIgnoreCase(redirectUrl.getHost())) {
+                // Protocol v2 guarantee: the deployed server returns a ContentService
+                // redirect to googleusercontent only after append/dedup completed.
+                // The redirect itself is therefore the receipt. Do not resolve/fetch
+                // the one-time URL.
+                if ("script.googleusercontent.com".equalsIgnoreCase(redirectUrl.getHost())) {
                     return UploadResult.success();
                 }
 
@@ -377,112 +368,6 @@ public class QueueUploadWorker extends Worker {
                 connection.disconnect();
             }
         }
-    }
-
-    /**
-     * One-time rollout handshake for append receipt protocol v2. Once this
-     * succeeds it is persisted, so normal mobile appends no longer touch
-     * script.googleusercontent.com.
-     */
-    private UploadResult confirmAppendReceiptProtocol(Context context) {
-        HttpURLConnection connection = null;
-        try {
-            String separator = QueueConfig.ENDPOINT.contains("?") ? "&" : "?";
-            String url = QueueConfig.ENDPOINT + separator
-                + "action=capabilities&token="
-                + URLEncoder.encode(QueueConfig.TOKEN, "UTF-8");
-            URL endpoint = new URL(url);
-            connection = (HttpURLConnection) endpoint.openConnection();
-            connection.setRequestMethod("GET");
-            connection.setInstanceFollowRedirects(false);
-            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            connection.setReadTimeout(READ_TIMEOUT_MS);
-            connection.setUseCaches(false);
-            connection.setRequestProperty("Accept", "application/json");
-            connection.setRequestProperty("Cache-Control", "no-cache");
-
-            int status = connection.getResponseCode();
-            if (isRedirect(status)) {
-                String location = connection.getHeaderField("Location");
-                if (location == null || location.trim().isEmpty()) {
-                    return UploadResult.failure(
-                        "Protocol check returned HTTP " + status + " without a redirect target",
-                        true
-                    );
-                }
-                URL redirectUrl = new URL(endpoint, location);
-                connection.disconnect();
-                connection = null;
-                UploadResult result = readContentRedirect(redirectUrl);
-                if (result.ok) {
-                    PendingQueueStore.confirmAppendReceiptV2(context);
-                }
-                return result;
-            }
-
-            String responseText = readResponse(connection, status);
-            if (status < 200 || status >= 300) {
-                return httpFailure("Protocol check", endpoint, status);
-            }
-            UploadResult result = parseQueueResponse(responseText);
-            if (result.ok) {
-                PendingQueueStore.confirmAppendReceiptV2(context);
-            }
-            return result;
-        } catch (Exception error) {
-            return exceptionFailure(error);
-        } finally {
-            if (connection != null) {
-                connection.disconnect();
-            }
-        }
-    }
-
-    /** Follow Apps Script's one-time ContentService response URL as GET. */
-    private UploadResult readContentRedirect(URL initialUrl) {
-        URL current = initialUrl;
-        for (int hop = 0; hop < 4; hop++) {
-            HttpURLConnection connection = null;
-            try {
-                connection = (HttpURLConnection) current.openConnection();
-                connection.setRequestMethod("GET");
-                connection.setInstanceFollowRedirects(false);
-                connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
-                connection.setReadTimeout(READ_TIMEOUT_MS);
-                connection.setUseCaches(false);
-                connection.setRequestProperty("Accept", "application/json");
-                connection.setRequestProperty("Cache-Control", "no-cache");
-    
-                int status = connection.getResponseCode();
-                if (isRedirect(status)) {
-                    String location = connection.getHeaderField("Location");
-                    if (location == null || location.trim().isEmpty()) {
-                        return UploadResult.failure(
-                            "Queue redirect returned HTTP " + status + " without a target at " + current.getHost(),
-                            true
-                        );
-                    }
-                    URL next = new URL(current, location);
-                    connection.disconnect();
-                    connection = null;
-                    current = next;
-                    continue;
-                }
-
-                String responseText = readResponse(connection, status);
-                if (status < 200 || status >= 300) {
-                    return httpFailure("Queue redirect", current, status);
-                }
-                return parseQueueResponse(responseText);
-            } catch (Exception error) {
-                return exceptionFailure(error);
-            } finally {
-                if (connection != null) {
-                    connection.disconnect();
-                }
-            }
-        }
-        return UploadResult.failure("Too many queue response redirects", true);
     }
 
     private static UploadResult parseQueueResponse(String responseText) {

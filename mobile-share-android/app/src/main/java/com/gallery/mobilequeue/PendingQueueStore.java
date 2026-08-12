@@ -22,7 +22,6 @@ public final class PendingQueueStore {
     private static final String KEY_LAST_UPLOAD_ERROR = "last_upload_error";
     private static final String KEY_UPLOAD_RUNNING_AT = "upload_running_at";
     private static final String KEY_RETRY_REQUESTED = "retry_requested";
-    private static final String KEY_APPEND_RECEIPT_V2_CONFIRMED = "append_receipt_v2_confirmed";
     private static final Object LOCK = new Object();
 
     private PendingQueueStore() {}
@@ -126,19 +125,6 @@ public final class PendingQueueStore {
         prefs(context).edit().remove(KEY_RETRY_REQUESTED).apply();
     }
 
-
-    /**
-     * True after this install has successfully read the server capabilities and
-     * confirmed append-receipt protocol v2. This prevents a new client from
-     * treating an old server's ContentService error redirect as append success.
-     */
-    public static boolean isAppendReceiptV2Confirmed(Context context) {
-        return prefs(context).getBoolean(KEY_APPEND_RECEIPT_V2_CONFIRMED, false);
-    }
-
-    public static void confirmAppendReceiptV2(Context context) {
-        prefs(context).edit().putBoolean(KEY_APPEND_RECEIPT_V2_CONFIRMED, true).apply();
-    }
 
     public static void setLastUploadError(Context context, String message) {
         String safe = message == null ? "Upload failed" : message.trim();
