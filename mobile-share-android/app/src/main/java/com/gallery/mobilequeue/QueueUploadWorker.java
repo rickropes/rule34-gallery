@@ -22,6 +22,7 @@ import java.net.HttpURLConnection;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.locks.ReentrantLock;
@@ -204,11 +205,22 @@ public class QueueUploadWorker extends Worker {
             return UploadResult.failure("Waiting for a validated internet connection", true);
         }
 
-        // Do NOT pin the HTTP socket to the Network snapshot returned above.
-        // URL.openConnection() uses Android's current default route, so a fresh
-        // retry can follow Wi-Fi/mobile/VPN failover instead of remaining stuck
-        // on a Network object that has just degraded or disconnected.
-        return uploadOnce(link);
+        // Before using the v2 append receipt, confirm once that the deployed
+        // Apps Script advertises that protocol. This one-time handshake still
+        // follows ContentService's response redirect; after it succeeds, append
+        // itself never depends on script.googleusercontent.com again.
+        if (!PendingQueueStore.isAppendReceiptV2Confirmed(context)) {
+            UploadResult capability = confirmAppendReceiptProtocol(context);
+            if (!capability.ok) {
+                return capability;
+            }
+            PendingQueueStore.confirmAppendReceiptV2(context);
+        }
+
+        // Do NOT pin the HTTP socket to a Network snapshot. URL.openConnection()
+        // uses Android's current default route, so a fresh retry can follow
+        // Wi-Fi/mobile/VPN failover.
+        return uploadOnce(context, link);
     }
 
     /**
@@ -294,7 +306,7 @@ public class QueueUploadWorker extends Worker {
         return isValidatedNetwork(context, active) ? active : null;
     }
 
-    private UploadResult uploadOnce(String link) {
+    private UploadResult uploadOnce(Context context, String link) {
         HttpURLConnection connection = null;
         try {
             JSONObject body = new JSONObject()
@@ -337,9 +349,20 @@ public class QueueUploadWorker extends Worker {
                     );
                 }
                 URL redirectUrl = new URL(endpoint, location);
-                connection.disconnect();
-                connection = null;
-                return readContentRedirect(redirectUrl);
+
+                // Protocol v2 guarantee: after capabilities were confirmed, the
+                // server returns a ContentService redirect to googleusercontent
+                // ONLY AFTER append/dedup has completed. The redirect itself is
+                // therefore the receipt. Do not resolve/fetch the one-time URL.
+                if (PendingQueueStore.isAppendReceiptV2Confirmed(context)
+                    && "script.googleusercontent.com".equalsIgnoreCase(redirectUrl.getHost())) {
+                    return UploadResult.success();
+                }
+
+                return UploadResult.failure(
+                    "Unexpected queue redirect to " + redirectUrl.getHost(),
+                    true
+                );
             }
 
             String responseText = readResponse(connection, status);
@@ -347,6 +370,65 @@ public class QueueUploadWorker extends Worker {
                 return httpFailure("Queue server", endpoint, status);
             }
             return parseQueueResponse(responseText);
+        } catch (Exception error) {
+            return exceptionFailure(error);
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    /**
+     * One-time rollout handshake for append receipt protocol v2. Once this
+     * succeeds it is persisted, so normal mobile appends no longer touch
+     * script.googleusercontent.com.
+     */
+    private UploadResult confirmAppendReceiptProtocol(Context context) {
+        HttpURLConnection connection = null;
+        try {
+            String separator = QueueConfig.ENDPOINT.contains("?") ? "&" : "?";
+            String url = QueueConfig.ENDPOINT + separator
+                + "action=capabilities&token="
+                + URLEncoder.encode(QueueConfig.TOKEN, "UTF-8");
+            URL endpoint = new URL(url);
+            connection = (HttpURLConnection) endpoint.openConnection();
+            connection.setRequestMethod("GET");
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            connection.setReadTimeout(READ_TIMEOUT_MS);
+            connection.setUseCaches(false);
+            connection.setRequestProperty("Accept", "application/json");
+            connection.setRequestProperty("Cache-Control", "no-cache");
+
+            int status = connection.getResponseCode();
+            if (isRedirect(status)) {
+                String location = connection.getHeaderField("Location");
+                if (location == null || location.trim().isEmpty()) {
+                    return UploadResult.failure(
+                        "Protocol check returned HTTP " + status + " without a redirect target",
+                        true
+                    );
+                }
+                URL redirectUrl = new URL(endpoint, location);
+                connection.disconnect();
+                connection = null;
+                UploadResult result = readContentRedirect(redirectUrl);
+                if (result.ok) {
+                    PendingQueueStore.confirmAppendReceiptV2(context);
+                }
+                return result;
+            }
+
+            String responseText = readResponse(connection, status);
+            if (status < 200 || status >= 300) {
+                return httpFailure("Protocol check", endpoint, status);
+            }
+            UploadResult result = parseQueueResponse(responseText);
+            if (result.ok) {
+                PendingQueueStore.confirmAppendReceiptV2(context);
+            }
+            return result;
         } catch (Exception error) {
             return exceptionFailure(error);
         } finally {

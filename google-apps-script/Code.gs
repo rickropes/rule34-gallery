@@ -2,6 +2,7 @@
 const QUEUE_FILE_ID = '11Rn-CJXUoKUAMT0V9KMCmV7aTFHlpHRk';
 const PRIVATE_TOKEN = 'BAyW42U2v4pLlFWSe6dAIj9mQgqYSqB99gweIuS07KgTOYKzkXFux2lqHxCT5SDX';
 const QUEUE_LOCK_WAIT_MS = 1500;
+const APPEND_LOCK_WAIT_MS = 8000;
 
 function json_(value) {
   return ContentService.createTextOutput(JSON.stringify(value))
@@ -30,14 +31,50 @@ function acquireQueueLock_() {
 }
 
 function busy_() {
-  // Clients treat retry:true as transient. Failing fast is better than making
-  // a mobile HTTP request sit inside waitLock(10000) until its own timeout.
   return json_({error:'Busy', retry:true});
+}
+
+/**
+ * Mobile append protocol v2.
+ *
+ * ContentService always redirects a successful TextOutput response to a
+ * one-time script.googleusercontent.com URL. The Android client intentionally
+ * treats the INITIAL redirect from script.google.com as the append receipt and
+ * does not fetch that one-time URL. Therefore this function must only return a
+ * TextOutput after the append has definitely completed.
+ *
+ * Errors throw instead of returning TextOutput, so an auth/validation/Drive/
+ * lock failure cannot be mistaken by Android for a successful append receipt.
+ */
+function appendAndReturnReceipt_(body) {
+  if (!authorized_(body.token)) throw new Error('Unauthorized');
+
+  const url = String(body.url || '').trim();
+  if (!/^https?:\/\//i.test(url)) throw new Error('Invalid URL');
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(APPEND_LOCK_WAIT_MS);
+  try {
+    const entries = readQueue_();
+    const duplicate = entries.some(entry => entry.url === url);
+    if (!duplicate) {
+      entries.push({id: Utilities.getUuid(), url, createdAt: new Date().toISOString()});
+      writeQueue_(entries);
+    }
+    // Reaching this return means the queue already contains the URL.
+    return json_({ok:true, duplicate, protocol:2});
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function doGet(e) {
   if (!authorized_(e.parameter.token)) return json_({error:'Unauthorized'});
-  if ((e.parameter.action || 'list') !== 'list') return json_({error:'Unsupported action'});
+  const action = e.parameter.action || 'list';
+  if (action === 'capabilities') {
+    return json_({ok:true, appendReceipt:2});
+  }
+  if (action !== 'list') return json_({error:'Unsupported action'});
 
   const lock = acquireQueueLock_();
   if (!lock) return busy_();
@@ -53,35 +90,26 @@ function doPost(e) {
   try {
     body = JSON.parse(e.postData.contents || '{}');
   } catch (_) {
-    return json_({error:'Invalid JSON'});
+    throw new Error('Invalid JSON');
+  }
+
+  const action = String(body.action || '');
+
+  // Important: append uses the v2 receipt semantics above. Do not convert its
+  // errors back into ContentService JSON responses or Android could interpret
+  // the redirect as success.
+  if (action === 'append') {
+    return appendAndReturnReceipt_(body);
   }
 
   if (!authorized_(body.token)) return json_({error:'Unauthorized'});
-
-  const action = String(body.action || '');
-  let url = '';
-  if (action === 'append') {
-    url = String(body.url || '').trim();
-    if (!/^https?:\/\//i.test(url)) return json_({error:'Invalid URL'});
-  } else if (action !== 'ack') {
-    return json_({error:'Unsupported action'});
-  }
+  if (action !== 'ack') return json_({error:'Unsupported action'});
 
   const lock = acquireQueueLock_();
   if (!lock) return busy_();
 
   try {
     const entries = readQueue_();
-
-    if (action === 'append') {
-      const duplicate = entries.some(entry => entry.url === url);
-      if (!duplicate) {
-        entries.push({id: Utilities.getUuid(), url, createdAt: new Date().toISOString()});
-        writeQueue_(entries);
-      }
-      return json_({ok:true, duplicate});
-    }
-
     const ids = new Set((body.ids || []).map(String));
     const remaining = entries.filter(entry => !ids.has(String(entry.id)));
     writeQueue_(remaining);

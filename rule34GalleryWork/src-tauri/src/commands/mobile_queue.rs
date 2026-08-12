@@ -1,5 +1,5 @@
 use std::{thread, time::Duration};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
@@ -11,6 +11,90 @@ use super::import_server::{enqueue_import_with_refresh, ImportRequest};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct QueueEntry { id: String, url: String, #[serde(default)] created_at: String }
+
+const QUEUE_RETRY_DELAYS_MS: [u64; 6] = [0, 500, 1500, 3000, 7000, 12000];
+
+fn queue_json_with_retry<F>(operation: &str, mut build_request: F) -> Result<Value, String>
+where
+    F: FnMut() -> RequestBuilder,
+{
+    let mut last_error = format!("{operation} failed");
+
+    for (attempt, delay_ms) in QUEUE_RETRY_DELAYS_MS.iter().enumerate() {
+        if *delay_ms > 0 {
+            thread::sleep(Duration::from_millis(*delay_ms));
+        }
+
+        let response = match build_request().send() {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("{operation} request failed: {error}");
+                if attempt + 1 < QUEUE_RETRY_DELAYS_MS.len() {
+                    continue;
+                }
+                return Err(last_error);
+            }
+        };
+
+        let status = response.status();
+        let final_url = response.url().clone();
+        let final_host = final_url.host_str().unwrap_or("").to_ascii_lowercase();
+        let body = match response.text() {
+            Ok(body) => body,
+            Err(error) => {
+                last_error = format!("{operation} response read failed: {error}");
+                if attempt + 1 < QUEUE_RETRY_DELAYS_MS.len() {
+                    continue;
+                }
+                return Err(last_error);
+            }
+        };
+
+        if !status.is_success() {
+            let transient = status.as_u16() == 408
+                || status.as_u16() == 425
+                || status.as_u16() == 429
+                || status.is_server_error()
+                || (status.as_u16() == 404 && final_host == "script.googleusercontent.com");
+            last_error = format!(
+                "{operation} returned HTTP {} at {}",
+                status.as_u16(),
+                if final_host.is_empty() { final_url.as_str() } else { final_host.as_str() }
+            );
+            if transient && attempt + 1 < QUEUE_RETRY_DELAYS_MS.len() {
+                // ContentService redirect URLs are one-time. Never retry the
+                // googleusercontent URL itself; this loop rebuilds the request
+                // from the stable /exec endpoint on every iteration.
+                continue;
+            }
+            return Err(last_error);
+        }
+
+        let value: Value = match serde_json::from_str(&body) {
+            Ok(value) => value,
+            Err(error) => {
+                let compact: String = body.chars().take(160).collect();
+                last_error = format!("{operation} returned invalid JSON: {error}; body: {compact}");
+                if attempt + 1 < QUEUE_RETRY_DELAYS_MS.len() {
+                    continue;
+                }
+                return Err(last_error);
+            }
+        };
+
+        let server_error = value.get("error").and_then(Value::as_str);
+        let server_retry = value.get("retry").and_then(Value::as_bool) == Some(true)
+            || server_error.map(|value| value.eq_ignore_ascii_case("Busy")).unwrap_or(false);
+        if server_retry && attempt + 1 < QUEUE_RETRY_DELAYS_MS.len() {
+            last_error = format!("{operation} temporarily unavailable: {}", server_error.unwrap_or("retry requested"));
+            continue;
+        }
+
+        return Ok(value);
+    }
+
+    Err(last_error)
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -146,12 +230,14 @@ fn sync_mobile_queue_blocking(app: AppHandle) -> Result<MobileSyncResult, String
     let endpoint=settings::get_setting(&conn,"mobile_queue_endpoint").map_err(|e|e.to_string())?.unwrap_or_default();
     let token=settings::get_setting(&conn,"mobile_queue_token").map_err(|e|e.to_string())?.unwrap_or_default(); drop(conn);
     if endpoint.is_empty()||token.is_empty(){return Ok(MobileSyncResult{fetched:0,imported:0,failed:0,messages:vec!["Mobile queue is not configured.".into()]})}
-    let client=Client::builder().user_agent("GalleryMobileQueue/0.1").build().map_err(|e|e.to_string())?;
-    let list_response:Value=client.get(&endpoint)
-        .query(&[("action","list"),("token",token.as_str())])
-        .send().map_err(|e|format!("Queue request failed: {e}"))?
-        .error_for_status().map_err(|e|format!("Queue returned an HTTP error: {e}"))?
-        .json().map_err(|e|format!("Invalid queue response: {e}"))?;
+    let client=Client::builder()
+        .user_agent("GalleryMobileQueue/0.2")
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
+        .build().map_err(|e|e.to_string())?;
+    let list_response:Value=queue_json_with_retry("Queue list", ||
+        client.get(&endpoint).query(&[("action","list"),("token",token.as_str())])
+    )?;
     if let Some(error)=list_response.get("error").and_then(Value::as_str) {
         return Err(format!("Queue error: {error}"));
     }
@@ -167,11 +253,10 @@ fn sync_mobile_queue_blocking(app: AppHandle) -> Result<MobileSyncResult, String
         match enqueue_import_with_refresh(&app,payload,false).and_then(|id|wait_for_job(&app,id)) {Ok(m)=>{completed.push(entry.id.clone());messages.push(m)},Err(e)=>{failed+=1;messages.push(format!("{}: {e}",entry.url))}}
     }
     if !completed.is_empty(){
-        let ack_response:Value=client.post(&endpoint)
-            .json(&serde_json::json!({"action":"ack","token":token,"ids":completed}))
-            .send().map_err(|e|format!("Failed to acknowledge queue: {e}"))?
-            .error_for_status().map_err(|e|format!("Queue acknowledgement returned an HTTP error: {e}"))?
-            .json().map_err(|e|format!("Invalid queue acknowledgement: {e}"))?;
+        let ack_payload=serde_json::json!({"action":"ack","token":token,"ids":completed});
+        let ack_response:Value=queue_json_with_retry("Queue acknowledgement", ||
+            client.post(&endpoint).json(&ack_payload)
+        )?;
         if ack_response.get("ok").and_then(Value::as_bool) != Some(true) {
             let error=ack_response.get("error").and_then(Value::as_str).unwrap_or("unknown queue error");
             return Err(format!("Queue acknowledgement failed: {error}"));

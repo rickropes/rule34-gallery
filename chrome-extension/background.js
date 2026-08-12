@@ -121,8 +121,15 @@ async function appendToMobileQueue(url){
       if(response.ok&&result.ok===true) return true;
 
       const message=result.error||`Queue HTTP ${response.status}`;
-      const transient=result.retry===true||response.status===408||response.status===425||response.status===429||response.status>=500;
-      lastError=new Error(message);
+      let finalHost="";
+      try{ finalHost=new URL(response.url).hostname.toLowerCase(); }catch(_){ /* ignore */ }
+      const transient=result.retry===true
+        ||response.status===408
+        ||response.status===425
+        ||response.status===429
+        ||response.status>=500
+        ||(response.status===404&&finalHost==="script.googleusercontent.com");
+      lastError=new Error(finalHost?`${message} at ${finalHost}`:message);
       if(!transient){ lastError.permanent=true; throw lastError; }
     }catch(error){
       lastError=error instanceof Error?error:new Error(String(error));
