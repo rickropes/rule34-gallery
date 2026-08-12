@@ -207,6 +207,7 @@ public class QueueUploadWorker extends Worker {
         // The currently deployed Apps Script uses append-receipt protocol v2.
         // A successful append returns ContentService only AFTER the URL is in
         // queue.txt, so the initial redirect itself is the receipt. Normal
+        // appends must never fetch the one-time script.googleusercontent.com
         // response URL; that host has proven unreliable on this network.
 
         // Do NOT pin the HTTP socket to a Network snapshot. URL.openConnection()
