@@ -5,6 +5,8 @@ const X_MENU = "gallery-import-x";
 const BSKY_MENU = "gallery-import-bsky";
 const NH_POOL_MENU = "gallery-add-collection-image";
 const LOCAL_ENDPOINT = "http://127.0.0.1:37891/import";
+const DEFAULT_MOBILE_QUEUE_ENDPOINT = "https://script.google.com/macros/s/AKfycbzgBoDbRkY3ZfM6CfDOxO48dsnDu7IYH6LR18yzhhmG1W-lSO6HVld7C0G_f4g9DdANxg/exec";
+const MOBILE_QUEUE_CONFIG_REVISION = 2;
 
 function registerContextMenus() {
   chrome.contextMenus.removeAll(() => {
@@ -17,7 +19,23 @@ function registerContextMenus() {
   });
 }
 
-chrome.runtime.onInstalled.addListener(registerContextMenus);
+async function ensureMobileQueueEndpoint() {
+  const values = await chrome.storage.sync.get(["mobileQueueEndpoint", "mobileQueueConfigRevision"]);
+  const saved = String(values.mobileQueueEndpoint || "").trim();
+  if (values.mobileQueueConfigRevision !== MOBILE_QUEUE_CONFIG_REVISION || !saved) {
+    await chrome.storage.sync.set({
+      mobileQueueEndpoint: DEFAULT_MOBILE_QUEUE_ENDPOINT,
+      mobileQueueConfigRevision: MOBILE_QUEUE_CONFIG_REVISION
+    });
+    return DEFAULT_MOBILE_QUEUE_ENDPOINT;
+  }
+  return saved;
+}
+
+chrome.runtime.onInstalled.addListener(async () => {
+  registerContextMenus();
+  await ensureMobileQueueEndpoint();
+});
 chrome.runtime.onStartup.addListener(registerContextMenus);
 registerContextMenus();
 
@@ -84,17 +102,35 @@ async function sendPayload(payload, allowQueue){
 
 async function appendToMobileQueue(url){
   if(!url) return false;
-  const {mobileQueueEndpoint="",mobileQueueToken=""}=await chrome.storage.sync.get(["mobileQueueEndpoint","mobileQueueToken"]);
-  const endpoint=String(mobileQueueEndpoint||"").trim();
+  const endpoint=await ensureMobileQueueEndpoint();
+  const {mobileQueueToken=""}=await chrome.storage.sync.get(["mobileQueueToken"]);
   const token=String(mobileQueueToken||"").trim();
-  if(!endpoint||!token) return false;
-  const response=await fetch(endpoint,{
-    method:"POST",
-    headers:{"Content-Type":"text/plain;charset=utf-8"},
-    body:JSON.stringify({action:"append",token,url})
-  });
-  const result=await response.json().catch(()=>({}));
-  if(!response.ok||result.error||result.ok!==true) throw new Error(result.error||`Queue HTTP ${response.status}`);
-  return true;
+  if(!token) return false;
+
+  const delays=[0,1000,2500,5000];
+  let lastError=null;
+  for(let attempt=0;attempt<delays.length;attempt++){
+    if(delays[attempt]) await new Promise(resolve=>setTimeout(resolve,delays[attempt]));
+    try{
+      const response=await fetch(endpoint,{
+        method:"POST",
+        headers:{"Content-Type":"text/plain;charset=utf-8"},
+        body:JSON.stringify({action:"append",token,url})
+      });
+      const result=await response.json().catch(()=>({}));
+      if(response.ok&&result.ok===true) return true;
+
+      const message=result.error||`Queue HTTP ${response.status}`;
+      const transient=result.retry===true||response.status===408||response.status===425||response.status===429||response.status>=500;
+      lastError=new Error(message);
+      if(!transient){ lastError.permanent=true; throw lastError; }
+    }catch(error){
+      lastError=error instanceof Error?error:new Error(String(error));
+      if(lastError.permanent||attempt===delays.length-1) throw lastError;
+      // Network/CORS-style fetch failures are worth another attempt; permanent
+      // JSON errors above throw after the current iteration.
+    }
+  }
+  throw lastError||new Error("Queue upload failed");
 }
 function notify(title,message){return chrome.notifications.create({type:"basic",iconUrl:"icon128.png",title,message});}

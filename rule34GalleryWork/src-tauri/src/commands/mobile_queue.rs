@@ -147,7 +147,16 @@ fn sync_mobile_queue_blocking(app: AppHandle) -> Result<MobileSyncResult, String
     let token=settings::get_setting(&conn,"mobile_queue_token").map_err(|e|e.to_string())?.unwrap_or_default(); drop(conn);
     if endpoint.is_empty()||token.is_empty(){return Ok(MobileSyncResult{fetched:0,imported:0,failed:0,messages:vec!["Mobile queue is not configured.".into()]})}
     let client=Client::builder().user_agent("GalleryMobileQueue/0.1").build().map_err(|e|e.to_string())?;
-    let entries:Vec<QueueEntry>=client.get(&endpoint).query(&[("action","list"),("token",token.as_str())]).send().map_err(|e|format!("Queue request failed: {e}"))?.error_for_status().map_err(|e|format!("Queue returned an error: {e}"))?.json().map_err(|e|format!("Invalid queue response: {e}"))?;
+    let list_response:Value=client.get(&endpoint)
+        .query(&[("action","list"),("token",token.as_str())])
+        .send().map_err(|e|format!("Queue request failed: {e}"))?
+        .error_for_status().map_err(|e|format!("Queue returned an HTTP error: {e}"))?
+        .json().map_err(|e|format!("Invalid queue response: {e}"))?;
+    if let Some(error)=list_response.get("error").and_then(Value::as_str) {
+        return Err(format!("Queue error: {error}"));
+    }
+    let entries:Vec<QueueEntry>=serde_json::from_value(list_response)
+        .map_err(|e|format!("Invalid queue list: {e}"))?;
     let mut completed=Vec::new(); let mut messages=Vec::new(); let mut failed=0;
     for entry in &entries {
         let parsed=match Url::parse(&entry.url){Ok(v)=>v,Err(e)=>{failed+=1;messages.push(format!("{}: {e}",entry.url));continue}};
@@ -158,7 +167,15 @@ fn sync_mobile_queue_blocking(app: AppHandle) -> Result<MobileSyncResult, String
         match enqueue_import_with_refresh(&app,payload,false).and_then(|id|wait_for_job(&app,id)) {Ok(m)=>{completed.push(entry.id.clone());messages.push(m)},Err(e)=>{failed+=1;messages.push(format!("{}: {e}",entry.url))}}
     }
     if !completed.is_empty(){
-        client.post(&endpoint).json(&serde_json::json!({"action":"ack","token":token,"ids":completed})).send().map_err(|e|format!("Failed to acknowledge queue: {e}"))?.error_for_status().map_err(|e|format!("Queue acknowledgement failed: {e}"))?;
+        let ack_response:Value=client.post(&endpoint)
+            .json(&serde_json::json!({"action":"ack","token":token,"ids":completed}))
+            .send().map_err(|e|format!("Failed to acknowledge queue: {e}"))?
+            .error_for_status().map_err(|e|format!("Queue acknowledgement returned an HTTP error: {e}"))?
+            .json().map_err(|e|format!("Invalid queue acknowledgement: {e}"))?;
+        if ack_response.get("ok").and_then(Value::as_bool) != Some(true) {
+            let error=ack_response.get("error").and_then(Value::as_str).unwrap_or("unknown queue error");
+            return Err(format!("Queue acknowledgement failed: {error}"));
+        }
     }
     if !completed.is_empty() {
         let _ = app.emit("library-changed", ());
@@ -169,10 +186,8 @@ fn sync_mobile_queue_blocking(app: AppHandle) -> Result<MobileSyncResult, String
 
 pub fn start_mobile_queue_worker(app: AppHandle) {
     std::thread::spawn(move || {
-        // Give startup library initialization a moment to finish, then perform
-        // the single startup sync. Further syncs are explicitly triggered when
-        // the gallery is opened or the Mobile queue button is pressed.
-        std::thread::sleep(Duration::from_secs(2));
+        // Library initialization is completed by setup before this worker starts,
+        // so the initial sync no longer depends on a timing-based sleep.
         if let Err(error) = sync_mobile_queue_blocking(app) {
             eprintln!("Startup mobile queue sync failed: {error}");
         }

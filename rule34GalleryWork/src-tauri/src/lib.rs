@@ -285,15 +285,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             commands::import_server::start_import_server(app.handle().clone());
-            commands::mobile_queue::start_mobile_queue_worker(app.handle().clone());
 
-            // Open the configured library in the backend so extension imports work
-            // even while no gallery WebView exists.
+            // Open the configured library before the first mobile queue sync.
+            // The previous startup worker raced this initialization and could
+            // permanently skip the launch-time sync if its fixed delay lost.
             if let Err(error) = commands::library::open_configured_library_state(
                 &app.state::<state::AppState>(),
             ) {
                 eprintln!("Failed to open configured library in background mode: {error}");
             }
+            commands::mobile_queue::start_mobile_queue_worker(app.handle().clone());
 
             #[cfg(desktop)]
             {

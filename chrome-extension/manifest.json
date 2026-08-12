@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gallery Post Importer",
-  "version": "0.9.2",
+  "version": "0.9.6",
   "description": "Send Rule34, Danbooru, Gelbooru, X/Twitter, Bluesky, and browser-managed image collections to the local gallery app.",
   "permissions": [
     "contextMenus",
@@ -29,7 +29,9 @@
     "https://exhentai.org/*",
     "https://*.exhentai.org/*",
     "https://bsky.app/*",
-    "https://www.bsky.app/*"
+    "https://www.bsky.app/*",
+    "https://script.google.com/*",
+    "https://script.googleusercontent.com/*"
   ],
   "background": {
     "service_worker": "background.js"
